@@ -8,9 +8,9 @@ app.use(express.json());
 
 const MONGO_URI = process.env.MONGO_URI;
 
-mongoose.connect(MONGO_URI)
-    .then(() => console.log('✅ Connecté à MongoDB Atlas'))
-    .catch(err => console.error('❌ Erreur MongoDB:', err));
+//mongoose.connect(MONGO_URI)
+  //  .then(() => console.log('✅ Connecté à MongoDB Atlas'))
+    //.catch(err => console.error('❌ Erreur MongoDB:', err));
 
 const User = mongoose.model('User', new mongoose.Schema({
     phone: String, password: String, name: String, solde: Number, data: Number
