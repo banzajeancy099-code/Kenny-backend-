@@ -13,8 +13,7 @@ const users = [
   { id: 2, nom: ' marie'}
 ];
 app.get('/',(req, res) => {
-  res.json({ message: 'backend kenny operationnel !
-           });
+  res.json({ message: 'backend kenny operationnel ! });
 
   app.listen(port, () => {
     console.log('serveur sur le port ${PORT}');
