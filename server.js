@@ -10,7 +10,7 @@ app.use(express.json());
 
 const users = [
   { id: 1, nom: ' Jean' },
-  { id: 2. nom: ' marie'}
+  { id: 2, nom: ' marie'}
 ];
 app.get('/',(req, res) => {
   res.json({ message: 'backend kenny operationnel !
