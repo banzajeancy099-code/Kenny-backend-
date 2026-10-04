@@ -15,14 +15,29 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 
-// Client Supabase
-const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+// Vérification des variables d'environnement au démarrage
+console.log('--- Vérification des variables ---');
+console.log('SUPABASE_URL:', SUPABASE_URL ? '✅ Présent' : '❌ Manquant');
+console.log('SUPABASE_ANON_KEY:', SUPABASE_ANON_KEY ? '✅ Présent' : '❌ Manquant');
+console.log('GEMINI_API_KEY:', GEMINI_API_KEY ? '✅ Présent' : '❌ Manquant');
+console.log('----------------------------------');
 
-// Route de test
+// Client Supabase (avec gestion d'erreur si les clés manquent)
+let supabase;
+if (SUPABASE_URL && SUPABASE_ANON_KEY) {
+  supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+} else {
+  console.error('❌ Impossible de créer le client Supabase : clés manquantes.');
+}
+
+// ============ ROUTE DE TEST ============
 app.get('/', (req, res) => {
-  res.json({ 
+  res.json({
     message: 'Backend Kenny opérationnel !',
-    supabase: SUPABASE_URL ? '✅ Connecté' : '❌ Manquant'
+    supabase: SUPABASE_URL ? '✅ Connecté' : '❌ Manquant',
+    gemini: GEMINI_API_KEY ? '✅ Connecté' : '❌ Manquant',
+    status: 'OK',
+    timestamp: new Date().toISOString()
   });
 });
 
@@ -40,13 +55,22 @@ app.post('/api/register', async (req, res) => {
     return res.status(400).json({ error: 'Mot de passe trop court (min 6)' });
   }
 
+  if (!supabase) {
+    return res.status(500).json({ error: 'Base de données non configurée' });
+  }
+
   try {
-    // Vérifier si l'user existe
-    const { data: existing } = await supabase
+    // Vérifier si l'utilisateur existe déjà
+    const { data: existing, error: checkError } = await supabase
       .from('users')
       .select('email')
       .eq('email', email)
-      .single();
+      .maybeSingle();
+
+    if (checkError) {
+      console.error('Erreur vérification:', checkError);
+      // On continue quand même, l'erreur peut être liée à RLS
+    }
 
     if (existing) {
       return res.status(400).json({ error: 'Cet email est déjà utilisé' });
@@ -55,24 +79,30 @@ app.post('/api/register', async (req, res) => {
     // Hasher le mot de passe
     const hashedPassword = await bcrypt.hash(password, 10);
 
-    // Créer l'user
+    // Créer l'utilisateur
     const { data, error } = await supabase
       .from('users')
       .insert([{ email, password: hashedPassword }])
       .select()
       .single();
 
-    if (error) throw error;
+    if (error) {
+      console.error('Erreur insertion Supabase:', error);
+      throw error;
+    }
 
-    res.json({ 
-      success: true, 
+    res.json({
+      success: true,
       message: 'Compte créé',
       user: { id: data.id, email: data.email }
     });
 
   } catch (error) {
     console.error('Erreur register:', error);
-    res.status(500).json({ error: 'Erreur serveur' });
+    res.status(500).json({
+      error: 'Erreur serveur',
+      details: error.message
+    });
   }
 });
 
@@ -84,8 +114,11 @@ app.post('/api/login', async (req, res) => {
     return res.status(400).json({ error: 'Email et mot de passe requis' });
   }
 
+  if (!supabase) {
+    return res.status(500).json({ error: 'Base de données non configurée' });
+  }
+
   try {
-    // Chercher l'user
     const { data: user, error } = await supabase
       .from('users')
       .select('*')
@@ -96,15 +129,14 @@ app.post('/api/login', async (req, res) => {
       return res.status(401).json({ error: 'Email ou mot de passe incorrect' });
     }
 
-    // Vérifier le mot de passe
     const valid = await bcrypt.compare(password, user.password);
 
     if (!valid) {
       return res.status(401).json({ error: 'Email ou mot de passe incorrect' });
     }
 
-    res.json({ 
-      success: true, 
+    res.json({
+      success: true,
       message: 'Connexion réussie',
       user: { id: user.id, email: user.email }
     });
@@ -117,7 +149,6 @@ app.post('/api/login', async (req, res) => {
 
 // ============ PROJETS ============
 
-// Sauvegarder un projet
 app.post('/api/projects', async (req, res) => {
   const { user_id, name, code } = req.body;
 
@@ -142,7 +173,6 @@ app.post('/api/projects', async (req, res) => {
   }
 });
 
-// Récupérer les projets d'un user
 app.get('/api/projects/:user_id', async (req, res) => {
   const { user_id } = req.params;
 
@@ -167,7 +197,7 @@ app.get('/api/projects/:user_id', async (req, res) => {
 
 app.post('/api/chat', async (req, res) => {
   const { message, history } = req.body;
-  
+
   if (!message) {
     return res.status(400).json({ error: 'Message requis' });
   }
@@ -178,7 +208,7 @@ app.post('/api/chat', async (req, res) => {
 
   try {
     const contents = [];
-    
+
     if (history && Array.isArray(history)) {
       history.forEach(msg => {
         contents.push({
@@ -187,11 +217,11 @@ app.post('/api/chat', async (req, res) => {
         });
       });
     }
-    
+
     contents.push({ role: 'user', parts: [{ text: message }] });
 
     const response = await axios.post(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent?key=${GEMINI_API_KEY}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`,
       {
         systemInstruction: {
           parts: [{
@@ -235,7 +265,7 @@ RÈGLES :
 
   } catch (error) {
     console.error('Erreur Gemini:', error.response?.data || error.message);
-    res.status(500).json({ 
+    res.status(500).json({
       error: 'Erreur IA',
       response: `Erreur : ${error.response?.data?.error?.message || error.message}`
     });
@@ -249,6 +279,30 @@ app.get('/api/users', (req, res) => {
   ]);
 });
 
+// ============ GESTION DES ERREURS 404 ============
+// Cette route doit être TOUJOURS à la fin, après toutes les autres routes
+app.use((req, res) => {
+  console.log(`Route non trouvée : ${req.method} ${req.url}`);
+  res.status(404).json({
+    error: 'Route non trouvée',
+    methode: req.method,
+    url: req.url,
+    routesDisponibles: [
+      'GET /',
+      'POST /api/register',
+      'POST /api/login',
+      'POST /api/projects',
+      'GET /api/projects/:user_id',
+      'POST /api/chat',
+      'GET /api/users'
+    ]
+  });
+});
+
+// ============ DÉMARRAGE ============
 app.listen(PORT, () => {
-  console.log('Serveur sur le port ' + PORT);
+  console.log('=================================');
+  console.log(`✅ Serveur démarré sur le port ${PORT}`);
+  console.log(`🌐 URL: http://localhost:${PORT}`);
+  console.log('=================================');
 });
