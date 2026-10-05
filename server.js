@@ -1,7 +1,6 @@
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
-const bcrypt = require('bcryptjs');
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
@@ -16,6 +15,7 @@ const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
+// ============ TEST ============
 app.get('/', (req, res) => {
   res.json({ 
     message: 'Backend Kenny opérationnel !',
@@ -23,13 +23,138 @@ app.get('/', (req, res) => {
   });
 });
 
+// ============ AUTH ============
+app.post('/api/register', async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) return res.status(400).json({ error: 'Champs requis' });
+  if (password.length < 6) return res.status(400).json({ error: 'Mot de passe trop court' });
+
+  const { data, error } = await supabase.auth.signUp({ email, password });
+  if (error) return res.status(400).json({ error: error.message });
+
+  res.json({ 
+    success: true, 
+    user: { id: data.user.id, email: data.user.email }
+  });
+});
+
+app.post('/api/login', async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) return res.status(400).json({ error: 'Champs requis' });
+
+  const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+  if (error) return res.status(401).json({ error: 'Email ou mot de passe incorrect' });
+
+  res.json({ 
+    success: true, 
+    user: { id: data.user.id, email: data.user.email }
+  });
+});
+
+// ============ PROJETS ============
+app.post('/api/projects', async (req, res) => {
+  const { user_id, name } = req.body;
+  if (!user_id || !name) return res.status(400).json({ error: 'user_id et name requis' });
+
+  try {
+    const { data, error } = await supabase
+      .from('projects')
+      .insert([{ user_id, name, code: '' }])
+      .select()
+      .single();
+
+    if (error) throw error;
+    res.json({ success: true, project: data });
+  } catch (error) {
+    console.error('Erreur:', error);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+app.get('/api/projects/:user_id', async (req, res) => {
+  const { user_id } = req.params;
+  try {
+    const { data, error } = await supabase
+      .from('projects')
+      .select('*')
+      .eq('user_id', user_id)
+      .order('name', { ascending: true });
+
+    if (error) throw error;
+    res.json({ projects: data });
+  } catch (error) {
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+app.delete('/api/projects/:id', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const { error } = await supabase.from('projects').delete().eq('id', id);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// Mettre à jour le code d'un projet
+app.put('/api/projects/:id', async (req, res) => {
+  const { id } = req.params;
+  const { code } = req.body;
+  try {
+    const { error } = await supabase
+      .from('projects')
+      .update({ code })
+      .eq('id', id);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// ============ MESSAGES ============
+app.post('/api/messages', async (req, res) => {
+  const { project_id, role, content } = req.body;
+  if (!project_id || !role || !content) {
+    return res.status(400).json({ error: 'Champs requis' });
+  }
+
+  try {
+    const { data, error } = await supabase
+      .from('messages')
+      .insert([{ project_id, role, content }])
+      .select()
+      .single();
+
+    if (error) throw error;
+    res.json({ success: true, message: data });
+  } catch (error) {
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+app.get('/api/messages/:project_id', async (req, res) => {
+  const { project_id } = req.params;
+  try {
+    const { data, error } = await supabase
+      .from('messages')
+      .select('*')
+      .eq('project_id', project_id)
+      .order('created_at', { ascending: true });
+
+    if (error) throw error;
+    res.json({ messages: data });
+  } catch (error) {
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
 // ============ CHAT IA ============
 app.post('/api/chat', async (req, res) => {
   const { message, history } = req.body;
-  
-  if (!message) {
-    return res.status(400).json({ error: 'Message requis' });
-  }
+  if (!message) return res.status(400).json({ error: 'Message requis' });
 
   if (!GEMINI_API_KEY) {
     return res.json({ response: `⚠️ Clé API manquante.`, simulated: true });
@@ -70,21 +195,7 @@ CODE :
 - Ne code JAMAIS avant confirmation explicite.
 - Quand tu codes, mets CHAQUE fichier dans un bloc de code SÉPARÉ avec son nom.
 - Format obligatoire : \`\`\`html:index.html ou \`\`\`css:styles.css ou \`\`\`javascript:app.js
-- Exemple :
-  \`\`\`html:index.html
-  <!DOCTYPE html>...
-  \`\`\`
-  \`\`\`css:styles.css
-  body { ... }
-  \`\`\`
-- Chaque langage va dans SON fichier :
-  - HTML → index.html
-  - CSS → styles.css
-  - JavaScript → app.js
-  - Python → main.py
-  - Kotlin → Main.kt
-  - JSON → data.json
-- Après avoir codé, relis ton code 5 FOIS ligne par ligne pour vérifier.
+- Chaque langage va dans SON fichier.
 
 FORMAT :
 - Mets ton texte AVANT les blocs de code.
@@ -116,46 +227,6 @@ EMOJIS :
       response: `Erreur : ${error.response?.data?.error?.message || error.message}`
     });
   }
-});
-
-// ============ AUTH (garde ce qu'on avait) ============
-app.post('/api/register', async (req, res) => {
-  const { email, password } = req.body;
-  if (!email || !password) return res.status(400).json({ error: 'Champs requis' });
-  try {
-    const hashedPassword = await bcrypt.hash(password, 10);
-    const { data, error } = await supabase
-      .from('users')
-      .insert([{ email, password: hashedPassword }])
-      .select()
-      .single();
-    if (error) throw error;
-    res.json({ success: true, user: { id: data.id, email: data.email } });
-  } catch (error) {
-    res.status(500).json({ error: 'Erreur serveur' });
-  }
-});
-
-app.post('/api/login', async (req, res) => {
-  const { email, password } = req.body;
-  if (!email || !password) return res.status(400).json({ error: 'Champs requis' });
-  try {
-    const { data: user } = await supabase
-      .from('users')
-      .select('*')
-      .eq('email', email)
-      .single();
-    if (!user) return res.status(401).json({ error: 'Email ou mot de passe incorrect' });
-    const valid = await bcrypt.compare(password, user.password);
-    if (!valid) return res.status(401).json({ error: 'Email ou mot de passe incorrect' });
-    res.json({ success: true, user: { id: user.id, email: user.email } });
-  } catch (error) {
-    res.status(500).json({ error: 'Erreur serveur' });
-  }
-});
-
-app.get('/api/users', (req, res) => {
-  res.json([{ id: 1, nom: 'jean' }, { id: 2, nom: 'marie' }]);
 });
 
 app.listen(PORT, () => {
