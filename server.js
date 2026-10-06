@@ -1,11 +1,41 @@
+const express = require('express');
+const cors = require('cors');
+const axios = require('axios');
+const { createClient } = require('@supabase/supabase-js');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.use(cors());
+app.use(express.json());
+
 // ============================================
-// AGENTS DE DÉPLOIEMENT
+// VARIABLES D'ENVIRONNEMENT
 // ============================================
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const SUPABASE_TOKEN = process.env.SUPABASE_TOKEN;
 const RENDER_TOKEN = process.env.RENDER_TOKEN;
 const CLOUDFLARE_TOKEN = process.env.CLOUDFLARE_TOKEN;
+const SUPABASE_ORG_ID = process.env.SUPABASE_ORG_ID;
+const RENDER_OWNER_ID = process.env.RENDER_OWNER_ID;
+const CLOUDFLARE_ACCOUNT_ID = process.env.CLOUDFLARE_ACCOUNT_ID;
+
+// Client Supabase (pour auth)
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+// ============================================
+// ROUTE DE TEST
+// ============================================
+app.get('/', (req, res) => {
+  res.json({ 
+    message: 'Backend Kenny opérationnel !',
+    supabase: SUPABASE_URL ? '✅ Connecté' : '❌ Manquant'
+  });
+});
 
 // ============================================
 // AGENT 1 : GITHUB (Créer un repo + push)
@@ -14,14 +44,13 @@ async function githubAgent(projectName, files) {
   console.log('🤖 GitHub Agent : début');
   
   try {
-    // 1. Créer le repo
     const repoRes = await axios.post(
       'https://api.github.com/user/repos',
       {
         name: projectName,
         private: true,
         auto_init: false,
-        description: `App générée par Kenny`
+        description: 'App générée par Kenny'
       },
       {
         headers: {
@@ -34,7 +63,6 @@ async function githubAgent(projectName, files) {
     const repo = repoRes.data;
     console.log('✅ Repo créé :', repo.full_name);
     
-    // 2. Push chaque fichier
     for (const file of files) {
       await axios.put(
         `https://api.github.com/repos/${repo.full_name}/contents/${file.nom}`,
@@ -75,12 +103,11 @@ async function supabaseAgent(projectName) {
   console.log('🤖 Supabase Agent : début');
   
   try {
-    // 1. Créer le projet
     const projectRes = await axios.post(
       'https://api.supabase.com/v1/projects',
       {
         name: projectName,
-        organization_id: process.env.SUPABASE_ORG_ID,
+        organization_id: SUPABASE_ORG_ID,
         region: 'eu-west-1',
         plan: 'free'
       },
@@ -123,7 +150,7 @@ async function renderAgent(projectName, repoUrl) {
       {
         type: 'web_service',
         name: projectName,
-        ownerId: process.env.RENDER_OWNER_ID,
+        ownerId: RENDER_OWNER_ID,
         repo: repoUrl,
         branch: 'main',
         autoDeploy: 'yes',
@@ -170,12 +197,11 @@ async function cloudflareAgent(domain, targetUrl) {
   console.log('🤖 Cloudflare Agent : début');
   
   try {
-    // 1. Créer la zone
     const zoneRes = await axios.post(
       'https://api.cloudflare.com/client/v4/zones',
       {
         name: domain,
-        account: { id: process.env.CLOUDFLARE_ACCOUNT_ID },
+        account: { id: CLOUDFLARE_ACCOUNT_ID },
         jump_start: true
       },
       {
@@ -189,7 +215,6 @@ async function cloudflareAgent(domain, targetUrl) {
     const zone = zoneRes.data.result;
     console.log('✅ Zone créée :', zone.id);
     
-    // 2. Créer le DNS
     await axios.post(
       `https://api.cloudflare.com/client/v4/zones/${zone.id}/dns_records`,
       {
@@ -224,10 +249,10 @@ async function cloudflareAgent(domain, targetUrl) {
 }
 
 // ============================================
-// ORCHESTRATEUR (Coordonne tout)
+// ORCHESTRATEUR
 // ============================================
 async function orchestratorDeploy(userId, projectId, projectName, files) {
-  console.log('🎯 Orchestrateur : début du déploiement');
+  console.log('🎯 Orchestrateur : début');
   
   const resultats = {
     github: null,
@@ -237,20 +262,13 @@ async function orchestratorDeploy(userId, projectId, projectName, files) {
     success: false
   };
   
-  // Étape 1 : GitHub
   resultats.github = await githubAgent(projectName, files);
-  if (!resultats.github.success) {
-    return resultats;
-  }
+  if (!resultats.github.success) return resultats;
   
-  // Étape 2 : Supabase
   resultats.supabase = await supabaseAgent(projectName);
-  
-  // Étape 3 : Render
   resultats.render = await renderAgent(projectName, resultats.github.clone_url);
   
-  // Étape 4 : Cloudflare (optionnel)
-  if (process.env.CLOUDFLARE_ACCOUNT_ID) {
+  if (CLOUDFLARE_ACCOUNT_ID) {
     resultats.cloudflare = await cloudflareAgent(
       `${projectName}.com`,
       resultats.render.service_url
@@ -258,14 +276,26 @@ async function orchestratorDeploy(userId, projectId, projectName, files) {
   }
   
   resultats.success = true;
-  console.log('🎉 Orchestrateur : déploiement terminé');
+  console.log('🎉 Orchestrateur : terminé');
   
   return resultats;
 }
 
 // ============================================
-// ROUTE DE DÉPLOIEMENT
+// ROUTES
 // ============================================
+
+// Test des agents
+app.get('/api/agents/test', (req, res) => {
+  res.json({
+    github: GITHUB_TOKEN ? '✅ Configuré' : '❌ Manquant',
+    supabase: SUPABASE_TOKEN ? '✅ Configuré' : '❌ Manquant',
+    render: RENDER_TOKEN ? '✅ Configuré' : '❌ Manquant',
+    cloudflare: CLOUDFLARE_TOKEN ? '✅ Configuré' : '❌ Manquant'
+  });
+});
+
+// Déploiement
 app.post('/api/deploy', async (req, res) => {
   const { userId, projectId, projectName, files } = req.body;
   
@@ -273,7 +303,7 @@ app.post('/api/deploy', async (req, res) => {
     return res.status(400).json({ error: 'projectName et files requis' });
   }
   
-  console.log('🚀 Déploiement demandé :', projectName);
+  console.log('🚀 Déploiement :', projectName);
   
   try {
     const resultats = await orchestratorDeploy(userId, projectId, projectName, files);
@@ -287,7 +317,7 @@ app.post('/api/deploy', async (req, res) => {
     
     res.json({
       success: true,
-      message: 'App déployée avec succès',
+      message: 'App déployée',
       deployment: resultats
     });
     
@@ -297,16 +327,102 @@ app.post('/api/deploy', async (req, res) => {
   }
 });
 
+// Auth
+app.post('/api/register', async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) return res.status(400).json({ error: 'Champs requis' });
+  if (password.length < 6) return res.status(400).json({ error: 'Mot de passe trop court' });
+
+  const { data, error } = await supabase.auth.signUp({ email, password });
+  if (error) return res.status(400).json({ error: error.message });
+
+  res.json({ 
+    success: true, 
+    user: { id: data.user.id, email: data.user.email }
+  });
+});
+
+app.post('/api/login', async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) return res.status(400).json({ error: 'Champs requis' });
+
+  const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+  if (error) return res.status(401).json({ error: 'Email ou mot de passe incorrect' });
+
+  res.json({ 
+    success: true, 
+    user: { id: data.user.id, email: data.user.email }
+  });
+});
+
+// Chat IA
+app.post('/api/chat', async (req, res) => {
+  const { message, history } = req.body;
+  if (!message) return res.status(400).json({ error: 'Message requis' });
+
+  if (!GEMINI_API_KEY) {
+    return res.json({ response: '⚠️ Clé API manquante.', simulated: true });
+  }
+
+  try {
+    const contents = [];
+    
+    if (history && Array.isArray(history)) {
+      history.forEach(msg => {
+        contents.push({
+          role: msg.role === 'user' ? 'user' : 'model',
+          parts: [{ text: msg.content }]
+        });
+      });
+    }
+    
+    contents.push({ role: 'user', parts: [{ text: message }] });
+
+    const response = await axios.post(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent?key=${GEMINI_API_KEY}`,
+      {
+        systemInstruction: {
+          parts: [{
+            text: `Tu es un développeur senior qui aide à créer des applications.
+
+COMPORTEMENT :
+- Sois parfois gentil, parfois direct.
+- Ne te présente JAMAIS.
+- Réponds en français.
+
+CODE :
+- Ne code JAMAIS avant confirmation.
+- Format : \`\`\`html:index.html
+- Chaque langage va dans SON fichier.`
+          }]
+        },
+        contents: contents,
+        generationConfig: {
+          temperature: 0.8,
+          maxOutputTokens: 4000
+        }
+      },
+      {
+        headers: { 'Content-Type': 'application/json' },
+        timeout: 60000
+      }
+    );
+
+    const reponse = response.data.candidates[0].content.parts[0].text;
+    res.json({ response: reponse });
+
+  } catch (error) {
+    console.error('Erreur Gemini:', error.response?.data || error.message);
+    res.status(500).json({ 
+      error: 'Erreur IA',
+      response: `Erreur : ${error.response?.data?.error?.message || error.message}`
+    });
+  }
+});
+
 // ============================================
-// ROUTE DE TEST DES AGENTS
+// DÉMARRAGE
 // ============================================
-app.get('/api/agents/test', async (req, res) => {
-  const resultats = {
-    github: GITHUB_TOKEN ? '✅ Configuré' : '❌ Manquant',
-    supabase: SUPABASE_TOKEN ? '✅ Configuré' : '❌ Manquant',
-    render: RENDER_TOKEN ? '✅ Configuré' : '❌ Manquant',
-    cloudflare: CLOUDFLARE_TOKEN ? '✅ Configuré' : '❌ Manquant'
-  };
-  
-  res.json(resultats);
+app.listen(PORT, () => {
+  console.log('Serveur sur le port ' + PORT);
 });
