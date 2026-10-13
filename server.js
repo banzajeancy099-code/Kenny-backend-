@@ -25,7 +25,6 @@ const SUPABASE_ORG_ID = process.env.SUPABASE_ORG_ID;
 const RENDER_OWNER_ID = process.env.RENDER_OWNER_ID;
 const CLOUDFLARE_ACCOUNT_ID = process.env.CLOUDFLARE_ACCOUNT_ID;
 
-// Client Supabase
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 // ============================================
@@ -265,7 +264,7 @@ async function cloudflareAgent(domain, targetUrl) {
 // ============================================
 // AGENT 5 : IMAGE (Cloudflare Workers AI)
 // ============================================
-async function imageAgent(prompt, options = {}) {
+async function imageAgent(prompt) {
   console.log('🎨 Image Agent : début');
   
   try {
@@ -273,7 +272,7 @@ async function imageAgent(prompt, options = {}) {
       `https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/run/@cf/black-forest-labs/flux-1-schnell`,
       {
         prompt: prompt,
-        steps: options.steps || 4
+        steps: 4
       },
       {
         headers: {
@@ -383,7 +382,7 @@ app.post('/api/deploy', async (req, res) => {
 
 // Génération d'image
 app.post('/api/image', async (req, res) => {
-  const { prompt, steps } = req.body;
+  const { prompt } = req.body;
   
   if (!prompt) {
     return res.status(400).json({ error: 'prompt requis' });
@@ -392,7 +391,7 @@ app.post('/api/image', async (req, res) => {
   console.log('🎨 Génération image :', prompt);
   
   try {
-    const result = await imageAgent(prompt, { steps });
+    const result = await imageAgent(prompt);
     
     if (!result.success) {
       return res.status(500).json({ error: result.error });
@@ -434,7 +433,9 @@ app.post('/api/login', async (req, res) => {
   });
 });
 
-// Chat IA
+// ============================================
+// CHAT IA (avec images AUTOMATIQUES)
+// ============================================
 app.post('/api/chat', async (req, res) => {
   const { message, history } = req.body;
   if (!message) return res.status(400).json({ error: 'Message requis' });
@@ -462,17 +463,45 @@ app.post('/api/chat', async (req, res) => {
       {
         systemInstruction: {
           parts: [{
-            text: `Tu es un développeur senior qui aide à créer des applications.
+            text: `Tu es un développeur senior expert en création d'applications.
 
 COMPORTEMENT :
-- Sois parfois gentil, parfois direct.
+- Sois parfois gentil, parfois direct. Équilibre. Comme un humain.
 - Ne te présente JAMAIS.
 - Réponds en français.
 
+QUESTIONS :
+- Pose autant de questions que nécessaire pour comprendre le besoin.
+- Si l'utilisateur dit "arrête" ou "c'est bon", obéis immédiatement.
+- 2-4 questions suffisent souvent.
+
+IMAGES (TRÈS IMPORTANT) :
+- DÈS QUE l'utilisateur décrit une app à créer (ex: "crée une app de livraison", "je veux une app de e-commerce", "fais-moi un site vitrine"), tu DOIS ajouter à la fin de ta réponse :
+  [IMAGE: description détaillée en anglais de l'interface à générer]
+
+- La description doit être VISUELLE et PRÉCISE :
+  - Type d'app (mobile mockup / web dashboard / site web)
+  - Couleurs précises (ex: "purple and white", "orange and black")
+  - Éléments clés (boutons, cartes, navigation, icons)
+  - Style (modern, minimal, glassmorphism, flat)
+  - Ambiance (clean, professional, playful)
+
+- EXEMPLES de bonnes descriptions :
+  [IMAGE: modern delivery mobile app interface, purple and white color scheme, map view at top, order cards below, bottom navigation bar, clean minimal design, iOS mockup]
+  [IMAGE: e-commerce website homepage, product grid layout, hero banner with sale, black and gold colors, luxury feel, desktop screenshot]
+  [IMAGE: fitness tracker app dashboard, dark mode, circular progress rings, blue accents, workout stats, modern UI, mobile mockup]
+
+- UTILISE [IMAGE: ...] UNIQUEMENT quand l'utilisateur décrit une app à créer.
+- N'utilise PAS [IMAGE: ...] pour les questions simples (ex: "comment ça marche").
+- Ajoute TOUJOURS le marqueur [IMAGE: ...] à la FIN de ta réponse, jamais au milieu.
+
 CODE :
-- Ne code JAMAIS avant confirmation.
+- Ne code JAMAIS avant confirmation explicite.
 - Format : \`\`\`html:index.html
-- Chaque langage va dans SON fichier.`
+- Chaque langage va dans SON fichier.
+
+EMOJIS :
+- Parfois, pas d'habitude.`
           }]
         },
         contents: contents,
@@ -487,8 +516,33 @@ CODE :
       }
     );
 
-    const reponse = response.data.candidates[0].content.parts[0].text;
-    res.json({ response: reponse });
+    let reponse = response.data.candidates[0].content.parts[0].text;
+    
+    // Détecter [IMAGE: ...]
+    let imageUrl = null;
+    const imageMatch = reponse.match(/\[IMAGE:\s*(.+?)\]/i);
+    
+    if (imageMatch) {
+      const imagePrompt = imageMatch[1].trim();
+      console.log('🎨 Image détectée automatiquement :', imagePrompt);
+      
+      // Retirer le marqueur [IMAGE: ...] du texte
+      reponse = reponse.replace(/\[IMAGE:\s*.+?\]/gi, '').trim();
+      
+      // Générer l'image
+      const imageResult = await imageAgent(imagePrompt);
+      if (imageResult.success) {
+        imageUrl = imageResult.image_url;
+        console.log('✅ Image générée et attachée');
+      } else {
+        console.error('❌ Image échouée:', imageResult.error);
+      }
+    }
+    
+    res.json({ 
+      response: reponse,
+      image_url: imageUrl
+    });
 
   } catch (error) {
     console.error('Erreur Gemini:', error.response?.data || error.message);
