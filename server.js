@@ -273,9 +273,7 @@ async function imageAgent(prompt, options = {}) {
       `https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/run/@cf/black-forest-labs/flux-1-schnell`,
       {
         prompt: prompt,
-        width: options.width || 1024,
-        height: options.height || 1024,
-        num_steps: 4
+        steps: options.steps || 4
       },
       {
         headers: {
@@ -299,10 +297,17 @@ async function imageAgent(prompt, options = {}) {
     };
     
   } catch (error) {
-    console.error('❌ Image Agent erreur:', error.response?.data || error.message);
+    let errorMsg = error.message;
+    if (error.response?.data) {
+      try {
+        const decoder = new TextDecoder();
+        errorMsg = decoder.decode(error.response.data);
+      } catch(e) {}
+    }
+    console.error('❌ Image Agent erreur:', errorMsg);
     return {
       success: false,
-      error: error.response?.data?.message || error.message
+      error: errorMsg
     };
   }
 }
@@ -378,7 +383,7 @@ app.post('/api/deploy', async (req, res) => {
 
 // Génération d'image
 app.post('/api/image', async (req, res) => {
-  const { prompt, width, height } = req.body;
+  const { prompt, steps } = req.body;
   
   if (!prompt) {
     return res.status(400).json({ error: 'prompt requis' });
@@ -387,7 +392,7 @@ app.post('/api/image', async (req, res) => {
   console.log('🎨 Génération image :', prompt);
   
   try {
-    const result = await imageAgent(prompt, { width, height });
+    const result = await imageAgent(prompt, { steps });
     
     if (!result.success) {
       return res.status(500).json({ error: result.error });
