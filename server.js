@@ -3,6 +3,10 @@ const cors = require('cors');
 const axios = require('axios');
 const { createClient } = require('@supabase/supabase-js');
 
+// NOUVEAUX IMPORTS POUR LE TERMINAL
+const antivirus = require('./agents/antivirus');
+const sandbox = require('./agents/sandbox');
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -45,7 +49,8 @@ app.get('/api/agents/test', (req, res) => {
     supabase: SUPABASE_TOKEN ? '✅ Configuré' : '❌ Manquant',
     render: RENDER_TOKEN ? '✅ Configuré' : '❌ Manquant',
     cloudflare: CLOUDFLARE_TOKEN ? '✅ Configuré' : '❌ Manquant',
-    image: CLOUDFLARE_AI_TOKEN ? '✅ Configuré' : '❌ Manquant'
+    image: CLOUDFLARE_AI_TOKEN ? '✅ Configuré' : '❌ Manquant',
+    e2b: process.env.E2B_API_KEY ? '✅ Configuré' : '❌ Manquant'
   });
 });
 
@@ -525,6 +530,39 @@ CODE :
       response: `Erreur : ${error.response?.data?.error?.message || error.message}`
     });
   }
+});
+
+// ============================================
+// NOUVELLES ROUTES : TERMINAL & SANDBOX
+// ============================================
+app.post('/api/terminal/exec', async (req, res) => {
+  const { commande, mode = 'normal' } = req.body;
+  if (!commande) return res.status(400).json({ error: 'Commande vide' });
+
+  const cmd = antivirus.nettoyerCommande(commande);
+  const verif = antivirus.verifierCommande(cmd, mode);
+
+  if (!verif.allowed) {
+    console.log(`🚫 BLOQUÉ : ${cmd} → ${verif.reason}`);
+    return res.json({ blocked: true, reason: verif.reason, level: verif.level, commande: cmd });
+  }
+
+  if (verif.needsConfirmation) {
+    return res.json({ needsConfirmation: true, reason: verif.reason, commande: cmd });
+  }
+
+  console.log(`✅ Exécution : ${cmd}`);
+  const result = await sandbox.executerCommande(cmd);
+  return res.json({ blocked: false, commande: cmd, ...result });
+});
+
+app.post('/api/terminal/close', async (req, res) => {
+  await sandbox.fermerSandbox();
+  res.json({ success: true, message: 'Sandbox fermée' });
+});
+
+app.get('/api/terminal/status', (req, res) => {
+  res.json({ active: !!sandbox.creerSandbox, message: 'Agent antivirus : ACTIF' });
 });
 
 // ============================================
