@@ -32,9 +32,6 @@ const GLOBAL_KEYS = {
 const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || 'kenny_default_secret_key_2026';
 const IV_LENGTH = 16;
 
-// ============================================
-// CHIFFREMENT DES CLÉS API
-// ============================================
 function chiffrer(text) {
   if (!text) return null;
   const iv = crypto.randomBytes(IV_LENGTH);
@@ -54,14 +51,9 @@ function dechiffrer(text) {
     let decrypted = decipher.update(encrypted);
     decrypted = Buffer.concat([decrypted, decipher.final()]);
     return decrypted.toString();
-  } catch (e) {
-    return null;
-  }
+  } catch (e) { return null; }
 }
 
-// ============================================
-// NEON CLIENT
-// ============================================
 async function getNeonClient(connString = null) {
   const client = new Client({
     connectionString: connString || GLOBAL_KEYS.neonConn,
@@ -71,28 +63,18 @@ async function getNeonClient(connString = null) {
   return client;
 }
 
-// ============================================
-// RÉCUPÉRER LES CLÉS D'UN USER (avec fallback)
-// ============================================
 async function getKeysForUser(firebase_uid) {
   const keys = { ...GLOBAL_KEYS };
-
   if (!firebase_uid) return keys;
-
   try {
     const client = await getNeonClient();
     const user = await client.query('SELECT id FROM users WHERE firebase_uid = $1', [firebase_uid]);
-    if (user.rows.length === 0) {
-      await client.end();
-      return keys;
-    }
+    if (user.rows.length === 0) { await client.end(); return keys; }
     const userId = user.rows[0].id;
     const userKeys = await client.query('SELECT * FROM user_api_keys WHERE user_id = $1', [userId]);
     await client.end();
-
     if (userKeys.rows.length > 0) {
       const uk = userKeys.rows[0];
-      // Décrypter chaque clé
       const decrypted = {
         gemini: dechiffrer(uk.gemini_key),
         neon: dechiffrer(uk.neon_key),
@@ -103,28 +85,16 @@ async function getKeysForUser(firebase_uid) {
         renderOwner: uk.render_owner_id,
         cloudflareAccount: uk.cloudflare_account_id
       };
-      // Fallback : si une clé user manque, utiliser celle de Kenny
-      Object.keys(decrypted).forEach(k => {
-        if (decrypted[k]) keys[k] = decrypted[k];
-      });
+      Object.keys(decrypted).forEach(k => { if (decrypted[k]) keys[k] = decrypted[k]; });
     }
-  } catch (e) {
-    console.log('Erreur getKeysForUser:', e.message);
-  }
-
+  } catch (e) {}
   return keys;
 }
 
-// ============================================
-// ROUTE DE TEST
-// ============================================
 app.get('/', (req, res) => {
   res.json({ message: 'Kenny OK', gemini: GLOBAL_KEYS.gemini ? '✅' : '❌' });
 });
 
-// ============================================
-// SYNC USER
-// ============================================
 app.post('/api/user/sync', async (req, res) => {
   const { firebase_uid, email } = req.body;
   if (!firebase_uid || !email) return res.status(400).json({ error: 'Champs requis' });
@@ -149,7 +119,7 @@ app.post('/api/user/sync', async (req, res) => {
 });
 
 // ============================================
-// ENVIRONNEMENT — Charger les clés
+// ENVIRONNEMENT — Charger les clés (masquées)
 // ============================================
 app.get('/api/env/load/:firebase_uid', async (req, res) => {
   let client;
@@ -160,12 +130,9 @@ app.get('/api/env/load/:firebase_uid', async (req, res) => {
     const result = await client.query('SELECT * FROM user_api_keys WHERE user_id = $1', [user.rows[0].id]);
     await client.end();
 
-    if (result.rows.length === 0) {
-      return res.json({ success: true, keys: {} });
-    }
+    if (result.rows.length === 0) return res.json({ success: true, keys: {} });
 
     const uk = result.rows[0];
-    // Ne renvoyer que des indicateurs (pas les vraies clés)
     res.json({
       success: true,
       keys: {
@@ -186,7 +153,7 @@ app.get('/api/env/load/:firebase_uid', async (req, res) => {
 });
 
 // ============================================
-// ENVIRONNEMENT — Sauvegarder les clés
+// ENVIRONNEMENT — Sauvegarder
 // ============================================
 app.post('/api/env/save', async (req, res) => {
   const { firebase_uid, keys } = req.body;
@@ -199,11 +166,9 @@ app.post('/api/env/save', async (req, res) => {
     if (user.rows.length === 0) { await client.end(); return res.status(404).json({ error: 'User non trouvé' }); }
     const userId = user.rows[0].id;
 
-    // Récupérer l'existant
     const existing = await client.query('SELECT * FROM user_api_keys WHERE user_id = $1', [userId]);
     const current = existing.rows.length > 0 ? existing.rows[0] : {};
 
-    // Préparer les valeurs (chiffrées si nouvelles, anciennes si pas touchées)
     const values = {
       gemini_key: keys.gemini && keys.gemini !== '••••••••' ? chiffrer(keys.gemini) : current.gemini_key,
       neon_key: keys.neon && keys.neon !== '••••••••' ? chiffrer(keys.neon) : current.neon_key,
@@ -245,14 +210,13 @@ app.post('/api/env/save', async (req, res) => {
 });
 
 // ============================================
-// ENVIRONNEMENT — Tester les clés
+// ENVIRONNEMENT — Tester
 // ============================================
 app.post('/api/env/test', async (req, res) => {
   const { firebase_uid } = req.body;
   const keys = await getKeysForUser(firebase_uid);
   const results = {};
 
-  // Test Gemini
   try {
     await axios.post(
       `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent?key=${keys.gemini}`,
@@ -260,42 +224,22 @@ app.post('/api/env/test', async (req, res) => {
       { timeout: 10000 }
     );
     results.gemini = '✅ OK';
-  } catch (e) {
-    results.gemini = '❌ ' + (e.response?.status || e.message);
-  }
+  } catch (e) { results.gemini = '❌ ' + (e.response?.status || e.message); }
 
-  // Test Neon API
   try {
-    await axios.get('https://console.neon.tech/api/v2/projects', {
-      headers: { 'Authorization': `Bearer ${keys.neon}` },
-      timeout: 10000
-    });
+    await axios.get('https://console.neon.tech/api/v2/projects', { headers: { 'Authorization': `Bearer ${keys.neon}` }, timeout: 10000 });
     results.neon = '✅ OK';
-  } catch (e) {
-    results.neon = '❌ ' + (e.response?.status || e.message);
-  }
+  } catch (e) { results.neon = '❌ ' + (e.response?.status || e.message); }
 
-  // Test GitHub
   try {
-    await axios.get('https://api.github.com/user', {
-      headers: { 'Authorization': `token ${keys.github}` },
-      timeout: 10000
-    });
+    await axios.get('https://api.github.com/user', { headers: { 'Authorization': `token ${keys.github}` }, timeout: 10000 });
     results.github = '✅ OK';
-  } catch (e) {
-    results.github = '❌ ' + (e.response?.status || e.message);
-  }
+  } catch (e) { results.github = '❌ ' + (e.response?.status || e.message); }
 
-  // Test Cloudflare
   try {
-    await axios.get('https://api.cloudflare.com/client/v4/user/tokens/verify', {
-      headers: { 'Authorization': `Bearer ${keys.cloudflare}` },
-      timeout: 10000
-    });
+    await axios.get('https://api.cloudflare.com/client/v4/user/tokens/verify', { headers: { 'Authorization': `Bearer ${keys.cloudflare}` }, timeout: 10000 });
     results.cloudflare = '✅ OK';
-  } catch (e) {
-    results.cloudflare = '❌ ' + (e.response?.status || e.message);
-  }
+  } catch (e) { results.cloudflare = '❌ ' + (e.response?.status || e.message); }
 
   res.json({ success: true, results });
 });
@@ -352,10 +296,10 @@ app.get('/api/projects/:project_id/details', async (req, res) => {
 });
 
 // ============================================
-// 🔥 CHAT STREAMING SSE
+// 🔥 CHAT STREAMING SSE (3 échecs max, zéro répétition)
 // ============================================
 app.post('/api/chat/stream', async (req, res) => {
-  const { message, history, firebase_uid, project_id, terminal_history, language, level } = req.body;
+  const { message, history, firebase_uid, project_id, terminal_history } = req.body;
   if (!message) return res.status(400).json({ error: 'Message requis' });
 
   const keys = await getKeysForUser(firebase_uid);
@@ -373,8 +317,6 @@ app.post('/api/chat/stream', async (req, res) => {
   req.on('close', () => { annule = true; });
 
   try {
-    envoyer('message', { role: 'ia', content: 'Je commence...' });
-
     const contents = [];
     if (history && Array.isArray(history)) {
       history.forEach(msg => {
@@ -389,42 +331,29 @@ app.post('/api/chat/stream', async (req, res) => {
 
     contents.push({ role: 'user', parts: [{ text: message }] });
 
-    const langMap = { fr: 'français', en: 'anglais', es: 'espagnol', sw: 'swahili', ar: 'arabe', zh: 'chinois', pt: 'portugais', de: 'allemand', it: 'italien', ru: 'russe' };
-    const langName = langMap[language] || 'la langue de l\'utilisateur';
-    const levelContext = level === 'pro' ? 'utilisateur PRO (technique, détaillé)' : level === 'debutant' ? 'utilisateur DÉBUTANT (simple, pédagogique)' : 'niveau inconnu (pose la question au début)';
-
     let iteration = 0;
-    let maxIterations = 5;
+    const MAX_ITERATIONS = 3;
     let memoire = [];
+    let dejaAffiche = new Set(); // Anti-répétition
 
-    while (iteration < maxIterations && !annule) {
+    while (iteration < MAX_ITERATIONS && !annule) {
       iteration++;
-      envoyer('status', { message: `Étape ${iteration}...` });
+      envoyer('status', { message: `Étape ${iteration}/${MAX_ITERATIONS}...` });
 
       const systemPrompt = `Tu es un développeur senior expert. Ton caractère est comme ChatGPT : poli, professionnel, clair, pédagogique.
 
-LANGUE : Tu réponds TOUJOURS en ${langName} (la langue de l'utilisateur).
-
-NIVEAU : ${levelContext}
-
-TON AU DÉBUT : Professionnel et courtois. Vouvoiement. Pas de familiarité.
-
 COMPORTEMENT FONDAMENTAL :
 - Tu PARLES et tu CODES EN MÊME TEMPS.
-- Tu annonces chaque étape avec des DÉTAILS (pas juste "je crée un fichier" mais "je crée index.html avec structure sémantique et métadonnées SEO").
-- Tu enchaînes les tâches SANS ATTENDRE.
-- Tu ne dis JAMAIS "Veux-tu que je continue ?" — tu continues.
-- Si tu vois une erreur, tu la corriges immédiatement.
+- Tu annonces chaque étape avec des détails.
+- Tu enchaînes SANS ATTENDRE.
 - Tu ne te présentes JAMAIS.
-
-SI L'USER EST PRO : donne des détails techniques (frameworks, patterns, optimisations, bonnes pratiques).
-SI L'USER EST DÉBUTANT : explique simplement, sans jargon.
+- Tu réponds en français.
 
 RÈGLES :
 
 1. AUTO-INSTALLATION :
-   - Si un langage/outil manque : [INSTALL: commande]
-   - Exemples : [INSTALL: apt-get install -y python3], [INSTALL: npm install -g create-react-app], [INSTALL: pip install flask]
+   - [INSTALL: commande] pour installer un langage/outil
+   - Exemples : [INSTALL: apt-get install -y python3], [INSTALL: pip install flask]
 
 2. CODE COMPLET :
    \`\`\`html:index.html
@@ -442,8 +371,8 @@ RÈGLES :
    - [IMAGE: description en anglais]
 
 4. TESTS :
-   - [COMMAND: node script.js] ou [COMMAND: python app.py] pour tester
-   - Si erreur → corriger automatiquement.
+   - [COMMAND: node script.js] pour tester
+   - Si erreur → corriger.
 
 ${terminalContext}
 
@@ -481,30 +410,50 @@ ${memoire.join('\n')}`;
       const blocks = extraireBlocs(reponse);
       const texteChat = reponse.replace(/```[\s\S]*?```/g, '').trim();
 
-      // Envoyer le texte
-      if (texteChat) envoyer('message', { role: 'ia', content: texteChat });
-
-      // Envoyer les fichiers
-      for (const block of blocks) {
-        envoyer('file', { name: block.nom, language: block.langage, content: block.contenu });
+      // 🔥 ANTI-RÉPÉTITION : n'envoyer que si pas déjà affiché
+      if (texteChat && !dejaAffiche.has(texteChat)) {
+        dejaAffiche.add(texteChat);
+        envoyer('message', { role: 'ia', content: texteChat });
       }
 
-      // Exécuter les installations
+      // Envoyer les fichiers (si nouveaux)
+      for (const block of blocks) {
+        const fileHash = block.nom + '_' + block.contenu.length;
+        if (!dejaAffiche.has(fileHash)) {
+          dejaAffiche.add(fileHash);
+          envoyer('file', { name: block.nom, language: block.langage, content: block.contenu });
+        }
+      }
+
+      // Exécuter installations
+      let installEchouee = false;
       for (const cmd of installations) {
         if (annule) break;
         envoyer('terminal', { command: cmd, type: 'install' });
         const result = await executerSecurise(cmd);
         envoyer('terminal_result', { command: cmd, ...result });
-        if (!result.success && result.stderr) memoire.push(`Erreur install ${cmd}: ${result.stderr}`);
+        if (!result.success) {
+          memoire.push(`Erreur install ${cmd}: ${result.stderr || result.reason}`);
+          installEchouee = true;
+        }
       }
 
-      // Exécuter les commandes
+      // Exécuter commandes manuelles
       for (const cmd of commands) {
         if (annule) break;
         envoyer('terminal', { command: cmd, type: 'command' });
         const result = await executerSecurise(cmd);
         envoyer('terminal_result', { command: cmd, ...result });
         if (!result.success && result.stderr) memoire.push(`Erreur ${cmd}: ${result.stderr}`);
+      }
+
+      // 🔥 SI INSTALLATION ÉCHOUÉE : arrêt immédiat
+      if (installEchouee) {
+        envoyer('message', {
+          role: 'ia',
+          content: `Je n'arrive pas à installer le langage/outil nécessaire. La sandbox E2B renvoie une erreur. Vérifie que E2B_API_KEY est bien configurée sur Render, ou contacte le support si ça persiste.`
+        });
+        break;
       }
 
       // Sauvegarder conversation
@@ -545,17 +494,23 @@ ${memoire.join('\n')}`;
         } catch (e) {}
       }
 
-      // Si pas d'erreur, fini
+      // Si pas d'erreur, terminé
       if (memoire.length === 0) {
         envoyer('done', { message: 'Terminé ✅' });
         break;
       }
 
-      // Sinon relancer avec corrections
-      if (iteration < maxIterations) {
-        envoyer('status', { message: 'Correction en cours...' });
+      // Si erreur, relancer (mais seulement si on n'est pas à la dernière itération)
+      if (iteration < MAX_ITERATIONS) {
+        envoyer('status', { message: `Correction (${iteration}/${MAX_ITERATIONS})...` });
         contents.push({ role: 'model', parts: [{ text: reponse }] });
-        contents.push({ role: 'user', parts: [{ text: `J'ai ces erreurs :\n${memoire.join('\n')}\n\nCorrige et renvoie.` }] });
+        contents.push({ role: 'user', parts: [{ text: `Erreurs :\n${memoire.join('\n')}\n\nCorrige.` }] });
+      } else {
+        envoyer('message', {
+          role: 'ia',
+          content: `J'ai essayé ${MAX_ITERATIONS} fois mais je n'arrive pas à corriger l'erreur. Peux-tu me donner plus de détails sur ce que tu attends ?`
+        });
+        envoyer('done', { message: 'Abandon après 3 essais' });
       }
     }
 
@@ -599,9 +554,6 @@ function extraireBlocs(text) {
   return blocs;
 }
 
-// ============================================
-// TERMINAL MANUEL
-// ============================================
 app.post('/api/terminal/exec', async (req, res) => {
   const { commande } = req.body;
   if (!commande) return res.status(400).json({ error: 'Commande vide' });
@@ -614,9 +566,6 @@ app.post('/api/terminal/close', async (req, res) => {
   res.json({ success: true });
 });
 
-// ============================================
-// DÉMARRAGE
-// ============================================
 app.listen(PORT, () => {
   console.log('Kenny serveur sur le port ' + PORT);
 });
