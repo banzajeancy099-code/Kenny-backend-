@@ -64,7 +64,7 @@ async function getNeonClient(connString = null) {
 }
 
 // ============================================
-// 🔥 RÉCUPÉRER LES CLÉS D'UN USER DEPUIS env_variables
+// RÉCUPÉRER LES CLÉS D'UN USER
 // ============================================
 async function getKeysForUser(firebase_uid) {
   const keys = { ...GLOBAL_KEYS };
@@ -75,7 +75,6 @@ async function getKeysForUser(firebase_uid) {
     if (user.rows.length === 0) { await client.end(); return keys; }
     const userId = user.rows[0].id;
     
-    // 🔥 Lire depuis env_variables (clé/valeur libres)
     const envVars = await client.query('SELECT key, value FROM env_variables WHERE user_id = $1', [userId]);
     await client.end();
     
@@ -102,7 +101,7 @@ async function getKeysForUser(firebase_uid) {
 }
 
 // ============================================
-// 🔥 VÉRIFIER LE QUOTA
+// VÉRIFIER LE QUOTA
 // ============================================
 async function verifierQuota(firebase_uid) {
   try {
@@ -366,7 +365,7 @@ app.get('/api/projects/:project_id/details', async (req, res) => {
 });
 
 // ============================================
-// 🔥 WORKSPACE AUTO
+// WORKSPACE AUTO
 // ============================================
 async function creerRepoGitHub(name, userToken) {
   try {
@@ -391,8 +390,9 @@ async function creerProjetNeon(name) {
       { headers: { 'Authorization': `Bearer ${GLOBAL_KEYS.neon}`, 'Content-Type': 'application/json', 'Accept': 'application/json' } }
     );
     const projectId = res.data.project.id;
+    // 🔥 CORRECTION : Ajouter ?database_name=neondb
     const connRes = await axios.get(
-      `https://console.neon.tech/api/v2/projects/${projectId}/connection_uri`,
+      `https://console.neon.tech/api/v2/projects/${projectId}/connection_uri?database_name=neondb`,
       { headers: { 'Authorization': `Bearer ${GLOBAL_KEYS.neon}`, 'Accept': 'application/json' } }
     );
     return { success: true, project_id: projectId, connection_uri: connRes.data.uri };
@@ -775,7 +775,6 @@ app.post('/api/terminal/exec', async (req, res) => {
   const { commande, firebase_uid } = req.body;
   if (!commande) return res.status(400).json({ error: 'Commande vide' });
   
-  // Vérifier le quota
   if (firebase_uid) {
     const quota = await verifierQuota(firebase_uid);
     if (!quota.allowed) {
