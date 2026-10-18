@@ -14,7 +14,7 @@ app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
 // ============================================
-// VARIABLES GLOBALES
+// VARIABLES GLOBALES (fallback)
 // ============================================
 const GLOBAL_KEYS = {
   gemini: process.env.GEMINI_API_KEY,
@@ -64,7 +64,7 @@ async function getNeonClient(connString = null) {
 }
 
 // ============================================
-// RÉCUPÉRER LES CLÉS USER (depuis env_variables)
+// 🔥 RÉCUPÉRER LES CLÉS D'UN USER DEPUIS env_variables
 // ============================================
 async function getKeysForUser(firebase_uid) {
   const keys = { ...GLOBAL_KEYS };
@@ -75,25 +75,29 @@ async function getKeysForUser(firebase_uid) {
     if (user.rows.length === 0) { await client.end(); return keys; }
     const userId = user.rows[0].id;
     
-    // Lire les variables depuis env_variables
+    // 🔥 Lire depuis env_variables (clé/valeur libres)
     const envVars = await client.query('SELECT key, value FROM env_variables WHERE user_id = $1', [userId]);
     await client.end();
     
     for (const row of envVars.rows) {
-      const k = row.key.toUpperCase();
+      const k = row.key.toUpperCase().trim();
       const v = dechiffrer(row.value);
       if (!v) continue;
       
-      if (k.includes('GEMINI')) keys.gemini = v;
-      else if (k.includes('NEON_API') || k === 'NEON_API_KEY') keys.neon = v;
-      else if (k.includes('GITHUB')) keys.github = v;
-      else if (k.includes('CLOUDFLARE') && k.includes('AI')) keys.cloudflareAI = v;
-      else if (k.includes('CLOUDFLARE') && k.includes('ACCOUNT')) keys.cloudflareAccount = v;
-      else if (k.includes('CLOUDFLARE')) keys.cloudflare = v;
-      else if (k.includes('RENDER_TOKEN') || k.includes('RENDER_API')) keys.render = v;
-      else if (k.includes('RENDER_OWNER')) keys.renderOwner = v;
+      if (k === 'GEMINI_API_KEY' || k === 'GEMINI') keys.gemini = v;
+      else if (k === 'NEON_API_KEY' || k === 'NEON') keys.neon = v;
+      else if (k === 'NEON_CONNECTION_STRING' || k === 'NEON_CONN') keys.neonConn = v;
+      else if (k === 'GITHUB_TOKEN' || k === 'GITHUB') keys.github = v;
+      else if (k === 'CLOUDFLARE_TOKEN' || k === 'CLOUDFLARE') keys.cloudflare = v;
+      else if (k === 'CLOUDFLARE_AI_TOKEN' || k === 'CLOUDFLARE_AI') keys.cloudflareAI = v;
+      else if (k === 'CLOUDFLARE_ACCOUNT_ID' || k === 'CLOUDFLARE_ACCOUNT') keys.cloudflareAccount = v;
+      else if (k === 'RENDER_TOKEN' || k === 'RENDER') keys.render = v;
+      else if (k === 'RENDER_OWNER_ID' || k === 'RENDER_OWNER') keys.renderOwner = v;
+      else if (k === 'E2B_API_KEY' || k === 'E2B') keys.e2b = v;
     }
-  } catch (e) {}
+  } catch (e) {
+    console.log('Erreur getKeysForUser:', e.message);
+  }
   return keys;
 }
 
@@ -115,13 +119,11 @@ async function verifierQuota(firebase_uid) {
     
     const u = user.rows[0];
     
-    // Plan payant = illimité
     if (u.plan === 'pro' || u.plan === 'premium') {
       await client.end();
       return { allowed: true, remaining: '∞', plan: u.plan };
     }
     
-    // Vérifier si on doit reset le compteur (nouveau jour)
     const today = new Date().toISOString().split('T')[0];
     const lastReset = u.last_command_reset ? u.last_command_reset.toISOString().split('T')[0] : null;
     
@@ -201,41 +203,7 @@ app.post('/api/user/sync', async (req, res) => {
 });
 
 // ============================================
-// 🔥 QUOTA
-// ============================================
-app.get('/api/quota/:firebase_uid', async (req, res) => {
-  try {
-    const client = await getNeonClient();
-    const user = await client.query(
-      'SELECT plan, commands_today, last_command_reset FROM users WHERE firebase_uid = $1',
-      [req.params.firebase_uid]
-    );
-    await client.end();
-    
-    if (user.rows.length === 0) {
-      return res.json({ success: false, error: 'User non trouvé' });
-    }
-    
-    const u = user.rows[0];
-    const LIMITE_FREE = 50;
-    const today = new Date().toISOString().split('T')[0];
-    const lastReset = u.last_command_reset ? u.last_command_reset.toISOString().split('T')[0] : null;
-    const commandsToday = lastReset === today ? (u.commands_today || 0) : 0;
-    
-    res.json({
-      success: true,
-      plan: u.plan || 'free',
-      used: commandsToday,
-      limit: LIMITE_FREE,
-      remaining: Math.max(0, LIMITE_FREE - commandsToday)
-    });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// ============================================
-// ENVIRONNEMENT DYNAMIQUE (env_variables)
+// ENVIRONNEMENT (env_variables - dynamique)
 // ============================================
 app.get('/api/env/load/:firebase_uid', async (req, res) => {
   let client;
@@ -398,6 +366,174 @@ app.get('/api/projects/:project_id/details', async (req, res) => {
 });
 
 // ============================================
+// 🔥 WORKSPACE AUTO
+// ============================================
+async function creerRepoGitHub(name, userToken) {
+  try {
+    const repoName = 'kenny-' + name.toLowerCase().replace(/[^a-z0-9-]/g, '-').substring(0, 40) + '-' + Date.now().toString(36);
+    const res = await axios.post(
+      'https://api.github.com/user/repos',
+      { name: repoName, private: true, auto_init: true, description: 'App générée par Kenny' },
+      { headers: { 'Authorization': `token ${userToken}`, 'Accept': 'application/vnd.github.v3+json' } }
+    );
+    return { success: true, repo: res.data.full_name, clone_url: res.data.clone_url, repo_url: res.data.html_url };
+  } catch (e) {
+    return { success: false, error: e.response?.data?.message || e.message };
+  }
+}
+
+async function creerProjetNeon(name) {
+  try {
+    const projectName = 'kenny-' + name.toLowerCase().replace(/[^a-z0-9-]/g, '-').substring(0, 40) + '-' + Date.now().toString(36);
+    const res = await axios.post(
+      'https://console.neon.tech/api/v2/projects',
+      { project: { name: projectName, region_id: 'aws-eu-central-1', pg_version: 16 } },
+      { headers: { 'Authorization': `Bearer ${GLOBAL_KEYS.neon}`, 'Content-Type': 'application/json', 'Accept': 'application/json' } }
+    );
+    const projectId = res.data.project.id;
+    const connRes = await axios.get(
+      `https://console.neon.tech/api/v2/projects/${projectId}/connection_uri`,
+      { headers: { 'Authorization': `Bearer ${GLOBAL_KEYS.neon}`, 'Accept': 'application/json' } }
+    );
+    return { success: true, project_id: projectId, connection_uri: connRes.data.uri };
+  } catch (e) {
+    return { success: false, error: e.response?.data?.message || e.message };
+  }
+}
+
+async function creerServiceRender(name, repoUrl, userToken, ownerId) {
+  if (!userToken || !ownerId) {
+    return { success: false, skipped: true, reason: 'Token Render non configuré' };
+  }
+  try {
+    const serviceName = 'kenny-' + name.toLowerCase().replace(/[^a-z0-9-]/g, '-').substring(0, 40) + '-' + Date.now().toString(36);
+    const res = await axios.post(
+      'https://api.render.com/v1/services',
+      {
+        type: 'web_service',
+        name: serviceName,
+        ownerId: ownerId,
+        repo: repoUrl,
+        branch: 'main',
+        autoDeploy: 'yes',
+        serviceDetails: {
+          env: 'node',
+          plan: 'free',
+          region: 'frankfurt',
+          envSpecificDetails: { buildCommand: 'npm install', startCommand: 'node server.js' }
+        }
+      },
+      { headers: { 'Authorization': `Bearer ${userToken}`, 'Content-Type': 'application/json', 'Accept': 'application/json' } }
+    );
+    return { success: true, service_id: res.data.service.id, service_url: res.data.service.serviceDetails?.url };
+  } catch (e) {
+    return { success: false, error: e.response?.data?.message || e.message };
+  }
+}
+
+async function creerZoneCloudflare(name) {
+  try {
+    const subdomain = name.toLowerCase().replace(/[^a-z0-9-]/g, '-').substring(0, 40) + '-' + Date.now().toString(36);
+    const domain = subdomain + '.kenny.app';
+    const zoneRes = await axios.post(
+      'https://api.cloudflare.com/client/v4/zones',
+      { name: domain, account: { id: GLOBAL_KEYS.cloudflareAccount }, jump_start: true },
+      { headers: { 'Authorization': `Bearer ${GLOBAL_KEYS.cloudflare}`, 'Content-Type': 'application/json' } }
+    );
+    if (!zoneRes.data.success) return { success: false, error: JSON.stringify(zoneRes.data.errors) };
+    return { success: true, zone_id: zoneRes.data.result.id, domain };
+  } catch (e) {
+    return { success: false, error: e.response?.data?.errors?.[0]?.message || e.message };
+  }
+}
+
+app.post('/api/workspaces/create', async (req, res) => {
+  const { firebase_uid, project_id, project_name } = req.body;
+  if (!firebase_uid || !project_id || !project_name) return res.status(400).json({ error: 'Champs requis' });
+
+  let client;
+  try {
+    client = await getNeonClient();
+    const user = await client.query('SELECT id FROM users WHERE firebase_uid = $1', [firebase_uid]);
+    if (user.rows.length === 0) { await client.end(); return res.status(404).json({ error: 'User non trouvé' }); }
+    const userId = user.rows[0].id;
+
+    const ws = await client.query(
+      'INSERT INTO workspaces (project_id, user_id, status) VALUES ($1, $2, $3) RETURNING id',
+      [project_id, userId, 'creating']
+    );
+    const workspaceId = ws.rows[0].id;
+    await client.end();
+
+    const keys = await getKeysForUser(firebase_uid);
+
+    console.log('📦 Création repo GitHub...');
+    const githubResult = await creerRepoGitHub(project_name, keys.github);
+    
+    console.log('🗄️ Création projet Neon...');
+    const neonResult = await creerProjetNeon(project_name);
+    
+    console.log('🚀 Création service Render...');
+    const renderResult = await creerServiceRender(
+      project_name,
+      githubResult.success ? githubResult.clone_url : '',
+      keys.render,
+      keys.renderOwner
+    );
+    
+    console.log('🌐 Création zone Cloudflare...');
+    const cloudflareResult = await creerZoneCloudflare(project_name);
+
+    const client2 = await getNeonClient();
+    await client2.query(`
+      UPDATE workspaces SET
+        github_repo = $1, github_clone_url = $2,
+        neon_project_id = $3, neon_connection_string = $4,
+        render_service_id = $5, render_service_url = $6,
+        cloudflare_zone_id = $7, cloudflare_domain = $8,
+        status = $9
+      WHERE id = $10
+    `, [
+      githubResult.repo || null, githubResult.clone_url || null,
+      neonResult.project_id || null, neonResult.connection_uri || null,
+      renderResult.service_id || null, renderResult.service_url || null,
+      cloudflareResult.zone_id || null, cloudflareResult.domain || null,
+      'ready',
+      workspaceId
+    ]);
+    await client2.end();
+
+    res.json({
+      success: true,
+      workspace: {
+        github: githubResult,
+        neon: neonResult,
+        render: renderResult,
+        cloudflare: cloudflareResult
+      }
+    });
+
+  } catch (error) {
+    if (client) await client.end();
+    console.error('Erreur workspace:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/workspaces/:project_id', async (req, res) => {
+  let client;
+  try {
+    client = await getNeonClient();
+    const result = await client.query('SELECT * FROM workspaces WHERE project_id = $1', [req.params.project_id]);
+    await client.end();
+    res.json({ success: true, workspace: result.rows[0] || null });
+  } catch (error) {
+    if (client) await client.end();
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
 // CHAT STREAMING
 // ============================================
 app.post('/api/chat/stream', async (req, res) => {
@@ -472,10 +608,6 @@ RÈGLES :
    - JAMAIS d'emojis dans le code
    - [IMAGE: description en anglais]
 
-4. TESTS :
-   - [COMMAND: node script.js] pour tester
-   - Si erreur → corriger.
-
 ${terminalContext}
 
 MÉMOIRE :
@@ -525,15 +657,6 @@ ${memoire.join('\n')}`;
       let installEchouee = false;
       for (const cmd of installations) {
         if (annule) break;
-        
-        // Vérifier quota
-        const quota = await verifierQuota(firebase_uid);
-        if (!quota.allowed) {
-          envoyer('message', { role: 'ia', content: `⚠️ ${quota.error}` });
-          envoyer('done', { message: 'Quota atteint' });
-          return;
-        }
-        
         envoyer('terminal', { command: cmd, type: 'install' });
         const result = await executerSecurise(cmd);
         envoyer('terminal_result', { command: cmd, ...result });
@@ -545,15 +668,6 @@ ${memoire.join('\n')}`;
 
       for (const cmd of commands) {
         if (annule) break;
-        
-        // Vérifier quota
-        const quota = await verifierQuota(firebase_uid);
-        if (!quota.allowed) {
-          envoyer('message', { role: 'ia', content: `⚠️ ${quota.error}` });
-          envoyer('done', { message: 'Quota atteint' });
-          return;
-        }
-        
         envoyer('terminal', { command: cmd, type: 'command' });
         const result = await executerSecurise(cmd);
         envoyer('terminal_result', { command: cmd, ...result });
@@ -654,11 +768,14 @@ function extraireBlocs(text) {
   return blocs;
 }
 
+// ============================================
+// TERMINAL (avec quota)
+// ============================================
 app.post('/api/terminal/exec', async (req, res) => {
   const { commande, firebase_uid } = req.body;
   if (!commande) return res.status(400).json({ error: 'Commande vide' });
   
-  // Vérifier quota
+  // Vérifier le quota
   if (firebase_uid) {
     const quota = await verifierQuota(firebase_uid);
     if (!quota.allowed) {
@@ -682,6 +799,43 @@ app.post('/api/terminal/close', async (req, res) => {
   res.json({ success: true });
 });
 
+// ============================================
+// QUOTA
+// ============================================
+app.get('/api/quota/:firebase_uid', async (req, res) => {
+  try {
+    const client = await getNeonClient();
+    const user = await client.query(
+      'SELECT plan, commands_today, last_command_reset FROM users WHERE firebase_uid = $1',
+      [req.params.firebase_uid]
+    );
+    await client.end();
+    
+    if (user.rows.length === 0) {
+      return res.json({ success: false, error: 'User non trouvé' });
+    }
+    
+    const u = user.rows[0];
+    const LIMITE_FREE = 50;
+    const today = new Date().toISOString().split('T')[0];
+    const lastReset = u.last_command_reset ? u.last_command_reset.toISOString().split('T')[0] : null;
+    const commandsToday = lastReset === today ? (u.commands_today || 0) : 0;
+    
+    res.json({
+      success: true,
+      plan: u.plan || 'free',
+      used: commandsToday,
+      limit: LIMITE_FREE,
+      remaining: Math.max(0, LIMITE_FREE - commandsToday)
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ============================================
+// DÉMARRAGE
+// ============================================
 app.listen(PORT, () => {
   console.log('Kenny serveur sur le port ' + PORT);
 });
