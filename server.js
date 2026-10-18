@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const { createClient } = require('@supabase/supabase-js');
+const { Client } = require('pg'); // NOUVEAU : pour Neon
 
 // NOUVEAUX IMPORTS POUR LE TERMINAL
 const antivirus = require('./agents/antivirus');
@@ -28,6 +29,10 @@ const SUPABASE_ORG_ID = process.env.SUPABASE_ORG_ID;
 const RENDER_OWNER_ID = process.env.RENDER_OWNER_ID;
 const CLOUDFLARE_ACCOUNT_ID = process.env.CLOUDFLARE_ACCOUNT_ID;
 
+// NOUVELLES VARIABLES NEON
+const NEON_API_KEY = process.env.NEON_API_KEY;
+const NEON_CONNECTION_STRING = process.env.NEON_CONNECTION_STRING;
+
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 // ============================================
@@ -36,7 +41,8 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 app.get('/', (req, res) => {
   res.json({ 
     message: 'Backend Kenny opérationnel !',
-    supabase: SUPABASE_URL ? '✅ Connecté' : '❌ Manquant'
+    supabase: SUPABASE_URL ? '✅ Connecté' : '❌ Manquant',
+    neon: NEON_API_KEY ? '✅ Configuré' : '❌ Manquant'
   });
 });
 
@@ -50,8 +56,71 @@ app.get('/api/agents/test', (req, res) => {
     render: RENDER_TOKEN ? '✅ Configuré' : '❌ Manquant',
     cloudflare: CLOUDFLARE_TOKEN ? '✅ Configuré' : '❌ Manquant',
     image: CLOUDFLARE_AI_TOKEN ? '✅ Configuré' : '❌ Manquant',
-    e2b: process.env.E2B_API_KEY ? '✅ Configuré' : '❌ Manquant'
+    e2b: process.env.E2B_API_KEY ? '✅ Configuré' : '❌ Manquant',
+    neon_api: NEON_API_KEY ? '✅ Configuré' : '❌ Manquant',
+    neon_db: NEON_CONNECTION_STRING ? '✅ Configuré' : '❌ Manquant'
   });
+});
+
+// ============================================
+// NOUVELLE ROUTE : TEST NEON
+// ============================================
+app.get('/api/neon/test', async (req, res) => {
+  const resultats = {
+    api_key: null,
+    connection_string: null,
+    timestamp: new Date().toISOString()
+  };
+
+  // 1. TEST API KEY (création de projet)
+  try {
+    const response = await axios.get('https://console.neon.tech/api/v2/projects', {
+      headers: {
+        'Authorization': `Bearer ${NEON_API_KEY}`,
+        'Accept': 'application/json'
+      }
+    });
+    resultats.api_key = {
+      success: true,
+      message: `✅ API Key valide (${response.data.projects.length} projets)`,
+      projects: response.data.projects.map(p => ({ id: p.id, name: p.name }))
+    };
+  } catch (error) {
+    resultats.api_key = {
+      success: false,
+      message: `❌ API Key invalide : ${error.response?.data?.message || error.message}`
+    };
+  }
+
+  // 2. TEST CONNECTION STRING (requête SQL)
+  try {
+    const client = new Client({
+      connectionString: NEON_CONNECTION_STRING,
+      ssl: { rejectUnauthorized: false }
+    });
+    await client.connect();
+    const result = await client.query('SELECT NOW() as now, version() as version');
+    await client.end();
+    resultats.connection_string = {
+      success: true,
+      message: '✅ Connexion PostgreSQL valide',
+      now: result.rows[0].now,
+      version: result.rows[0].version.split(' ').slice(0, 2).join(' ')
+    };
+  } catch (error) {
+    resultats.connection_string = {
+      success: false,
+      message: `❌ Connexion échouée : ${error.message}`
+    };
+  }
+
+  // 3. RÉSULTAT GLOBAL
+  resultats.success = resultats.api_key.success && resultats.connection_string.success;
+  resultats.message = resultats.success 
+    ? '🎉 Neon est prêt pour Kenny !' 
+    : '⚠️ Il y a des problèmes à corriger';
+
+  res.json(resultats);
 });
 
 // ============================================
@@ -114,45 +183,12 @@ async function githubAgent(projectName, files) {
 }
 
 // ============================================
-// AGENT 2 : SUPABASE
+// AGENT 2 : SUPABASE (déprécié, remplacé par Neon)
 // ============================================
 async function supabaseAgent(projectName) {
-  console.log('🤖 Supabase Agent : début');
-  
-  try {
-    const projectRes = await axios.post(
-      'https://api.supabase.com/v1/projects',
-      {
-        name: projectName,
-        organization_id: SUPABASE_ORG_ID,
-        region: 'eu-west-1',
-        plan: 'free'
-      },
-      {
-        headers: {
-          'Authorization': `Bearer ${SUPABASE_TOKEN}`,
-          'Content-Type': 'application/json'
-        }
-      }
-    );
-    
-    const project = projectRes.data;
-    console.log('✅ Projet Supabase créé :', project.id);
-    
-    return {
-      success: true,
-      project_id: project.id,
-      project_url: `https://${project.id}.supabase.co`,
-      api_key: project.anon_key
-    };
-    
-  } catch (error) {
-    console.error('❌ Supabase Agent erreur:', error.response?.data || error.message);
-    return {
-      success: false,
-      error: error.response?.data?.message || error.message
-    };
-  }
+  console.log('🤖 Supabase Agent : début (déprécié)');
+  // On garde la fonction pour compatibilité, mais on utilise Neon
+  return { success: false, error: 'Supabase remplacé par Neon' };
 }
 
 // ============================================
