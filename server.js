@@ -14,7 +14,7 @@ app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
 // ============================================
-// VARIABLES GLOBALES (fallback)
+// VARIABLES GLOBALES
 // ============================================
 const GLOBAL_KEYS = {
   gemini: process.env.GEMINI_API_KEY,
@@ -119,7 +119,7 @@ app.post('/api/user/sync', async (req, res) => {
 });
 
 // ============================================
-// ENVIRONNEMENT — Charger les clés (masquées)
+// ENVIRONNEMENT
 // ============================================
 app.get('/api/env/load/:firebase_uid', async (req, res) => {
   let client;
@@ -129,9 +129,7 @@ app.get('/api/env/load/:firebase_uid', async (req, res) => {
     if (user.rows.length === 0) { await client.end(); return res.json({ success: true, keys: {} }); }
     const result = await client.query('SELECT * FROM user_api_keys WHERE user_id = $1', [user.rows[0].id]);
     await client.end();
-
     if (result.rows.length === 0) return res.json({ success: true, keys: {} });
-
     const uk = result.rows[0];
     res.json({
       success: true,
@@ -152,23 +150,17 @@ app.get('/api/env/load/:firebase_uid', async (req, res) => {
   }
 });
 
-// ============================================
-// ENVIRONNEMENT — Sauvegarder
-// ============================================
 app.post('/api/env/save', async (req, res) => {
   const { firebase_uid, keys } = req.body;
   if (!firebase_uid || !keys) return res.status(400).json({ error: 'Champs requis' });
-
   let client;
   try {
     client = await getNeonClient();
     const user = await client.query('SELECT id FROM users WHERE firebase_uid = $1', [firebase_uid]);
     if (user.rows.length === 0) { await client.end(); return res.status(404).json({ error: 'User non trouvé' }); }
     const userId = user.rows[0].id;
-
     const existing = await client.query('SELECT * FROM user_api_keys WHERE user_id = $1', [userId]);
     const current = existing.rows.length > 0 ? existing.rows[0] : {};
-
     const values = {
       gemini_key: keys.gemini && keys.gemini !== '••••••••' ? chiffrer(keys.gemini) : current.gemini_key,
       neon_key: keys.neon && keys.neon !== '••••••••' ? chiffrer(keys.neon) : current.neon_key,
@@ -179,7 +171,6 @@ app.post('/api/env/save', async (req, res) => {
       render_owner_id: keys.renderOwner || current.render_owner_id,
       cloudflare_account_id: keys.cloudflareAccount || current.cloudflare_account_id
     };
-
     if (existing.rows.length > 0) {
       await client.query(`
         UPDATE user_api_keys SET
@@ -200,7 +191,6 @@ app.post('/api/env/save', async (req, res) => {
           values.cloudflare_token, values.cloudflare_ai_token,
           values.render_token, values.render_owner_id, values.cloudflare_account_id]);
     }
-
     await client.end();
     res.json({ success: true, message: 'Clés sauvegardées' });
   } catch (error) {
@@ -209,38 +199,27 @@ app.post('/api/env/save', async (req, res) => {
   }
 });
 
-// ============================================
-// ENVIRONNEMENT — Tester
-// ============================================
 app.post('/api/env/test', async (req, res) => {
   const { firebase_uid } = req.body;
   const keys = await getKeysForUser(firebase_uid);
   const results = {};
-
   try {
-    await axios.post(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent?key=${keys.gemini}`,
-      { contents: [{ role: 'user', parts: [{ text: 'test' }] }] },
-      { timeout: 10000 }
-    );
+    await axios.post(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent?key=${keys.gemini}`,
+      { contents: [{ role: 'user', parts: [{ text: 'test' }] }] }, { timeout: 10000 });
     results.gemini = '✅ OK';
   } catch (e) { results.gemini = '❌ ' + (e.response?.status || e.message); }
-
   try {
     await axios.get('https://console.neon.tech/api/v2/projects', { headers: { 'Authorization': `Bearer ${keys.neon}` }, timeout: 10000 });
     results.neon = '✅ OK';
   } catch (e) { results.neon = '❌ ' + (e.response?.status || e.message); }
-
   try {
     await axios.get('https://api.github.com/user', { headers: { 'Authorization': `token ${keys.github}` }, timeout: 10000 });
     results.github = '✅ OK';
   } catch (e) { results.github = '❌ ' + (e.response?.status || e.message); }
-
   try {
     await axios.get('https://api.cloudflare.com/client/v4/user/tokens/verify', { headers: { 'Authorization': `Bearer ${keys.cloudflare}` }, timeout: 10000 });
     results.cloudflare = '✅ OK';
   } catch (e) { results.cloudflare = '❌ ' + (e.response?.status || e.message); }
-
   res.json({ success: true, results });
 });
 
@@ -296,7 +275,7 @@ app.get('/api/projects/:project_id/details', async (req, res) => {
 });
 
 // ============================================
-// 🔥 CHAT STREAMING SSE (3 échecs max, zéro répétition)
+// CHAT STREAMING
 // ============================================
 app.post('/api/chat/stream', async (req, res) => {
   const { message, history, firebase_uid, project_id, terminal_history } = req.body;
@@ -304,7 +283,6 @@ app.post('/api/chat/stream', async (req, res) => {
 
   const keys = await getKeysForUser(firebase_uid);
   if (!keys.gemini) return res.status(500).json({ error: 'Clé Gemini manquante' });
-
   if (!project_id) return res.json({ error: 'Crée un projet d\'abord', need_project: true });
 
   res.setHeader('Content-Type', 'text/event-stream');
@@ -323,18 +301,16 @@ app.post('/api/chat/stream', async (req, res) => {
         contents.push({ role: msg.role === 'user' ? 'user' : 'model', parts: [{ text: msg.content }] });
       });
     }
-
     let terminalContext = '';
     if (terminal_history && terminal_history.length > 0) {
       terminalContext = `\n\nCOMMANDES RÉCENTES :\n${terminal_history.slice(-10).join('\n')}`;
     }
-
     contents.push({ role: 'user', parts: [{ text: message }] });
 
     let iteration = 0;
     const MAX_ITERATIONS = 3;
     let memoire = [];
-    let dejaAffiche = new Set(); // Anti-répétition
+    let dejaAffiche = new Set();
 
     while (iteration < MAX_ITERATIONS && !annule) {
       iteration++;
@@ -342,7 +318,7 @@ app.post('/api/chat/stream', async (req, res) => {
 
       const systemPrompt = `Tu es un développeur senior expert. Ton caractère est comme ChatGPT : poli, professionnel, clair, pédagogique.
 
-COMPORTEMENT FONDAMENTAL :
+COMPORTEMENT :
 - Tu PARLES et tu CODES EN MÊME TEMPS.
 - Tu annonces chaque étape avec des détails.
 - Tu enchaînes SANS ATTENDRE.
@@ -351,9 +327,14 @@ COMPORTEMENT FONDAMENTAL :
 
 RÈGLES :
 
-1. AUTO-INSTALLATION :
-   - [INSTALL: commande] pour installer un langage/outil
-   - Exemples : [INSTALL: apt-get install -y python3], [INSTALL: pip install flask]
+1. AUTO-INSTALLATION (ATTENTION) :
+   - AVANT d'installer, VÉRIFIE si déjà présent avec [COMMAND: python3 --version] ou [COMMAND: node --version]
+   - NE FAIS JAMAIS "apt-get update" (bloqué dans la sandbox E2B)
+   - NE FAIS JAMAIS "apt-get install python3" (déjà installé par défaut)
+   - La sandbox E2B a DÉJÀ : Python 3.13, Node.js, npm, pip, git, curl, wget
+   - Si l'user demande Python/Node : PAS BESOIN d'installer, c'est déjà là.
+   - Pour installer un paquet Python : [INSTALL: pip install flask]
+   - Pour installer un paquet Node : [INSTALL: npm install react]
 
 2. CODE COMPLET :
    \`\`\`html:index.html
@@ -393,30 +374,26 @@ ${memoire.join('\n')}`;
 
       let reponse = response.data.candidates[0].content.parts[0].text;
 
-      // Extraire installations
       const installations = [];
       let match;
       const installRegex = /\[INSTALL:\s*(.+?)\]/gi;
       while ((match = installRegex.exec(reponse)) !== null) installations.push(match[1].trim());
       reponse = reponse.replace(/\[INSTALL:\s*.+?\]/gi, '').trim();
 
-      // Extraire commandes
       const commands = [];
       const cmdRegex = /\[COMMAND:\s*(.+?)\]/gi;
       while ((match = cmdRegex.exec(reponse)) !== null) commands.push(match[1].trim());
       reponse = reponse.replace(/\[COMMAND:\s*.+?\]/gi, '').trim();
 
-      // Extraire fichiers
       const blocks = extraireBlocs(reponse);
       const texteChat = reponse.replace(/```[\s\S]*?```/g, '').trim();
 
-      // 🔥 ANTI-RÉPÉTITION : n'envoyer que si pas déjà affiché
+      // Anti-répétition
       if (texteChat && !dejaAffiche.has(texteChat)) {
         dejaAffiche.add(texteChat);
         envoyer('message', { role: 'ia', content: texteChat });
       }
 
-      // Envoyer les fichiers (si nouveaux)
       for (const block of blocks) {
         const fileHash = block.nom + '_' + block.contenu.length;
         if (!dejaAffiche.has(fileHash)) {
@@ -425,7 +402,6 @@ ${memoire.join('\n')}`;
         }
       }
 
-      // Exécuter installations
       let installEchouee = false;
       for (const cmd of installations) {
         if (annule) break;
@@ -438,7 +414,6 @@ ${memoire.join('\n')}`;
         }
       }
 
-      // Exécuter commandes manuelles
       for (const cmd of commands) {
         if (annule) break;
         envoyer('terminal', { command: cmd, type: 'command' });
@@ -447,16 +422,12 @@ ${memoire.join('\n')}`;
         if (!result.success && result.stderr) memoire.push(`Erreur ${cmd}: ${result.stderr}`);
       }
 
-      // 🔥 SI INSTALLATION ÉCHOUÉE : arrêt immédiat
+      // 🔥 Si installation échouée, on continue quand même (peut-être déjà installé)
       if (installEchouee) {
-        envoyer('message', {
-          role: 'ia',
-          content: `Je n'arrive pas à installer le langage/outil nécessaire. La sandbox E2B renvoie une erreur. Vérifie que E2B_API_KEY est bien configurée sur Render, ou contacte le support si ça persiste.`
-        });
-        break;
+        console.log('⚠️ Installation échouée mais on continue');
+        memoire = memoire.filter(m => !m.includes('Erreur install'));
       }
 
-      // Sauvegarder conversation
       if (firebase_uid) {
         try {
           const client = await getNeonClient();
@@ -475,7 +446,6 @@ ${memoire.join('\n')}`;
         } catch (e) {}
       }
 
-      // Sauvegarder fichiers
       if (blocks.length > 0) {
         try {
           const client = await getNeonClient();
@@ -494,28 +464,22 @@ ${memoire.join('\n')}`;
         } catch (e) {}
       }
 
-      // Si pas d'erreur, terminé
       if (memoire.length === 0) {
         envoyer('done', { message: 'Terminé ✅' });
         break;
       }
 
-      // Si erreur, relancer (mais seulement si on n'est pas à la dernière itération)
       if (iteration < MAX_ITERATIONS) {
         envoyer('status', { message: `Correction (${iteration}/${MAX_ITERATIONS})...` });
         contents.push({ role: 'model', parts: [{ text: reponse }] });
         contents.push({ role: 'user', parts: [{ text: `Erreurs :\n${memoire.join('\n')}\n\nCorrige.` }] });
       } else {
-        envoyer('message', {
-          role: 'ia',
-          content: `J'ai essayé ${MAX_ITERATIONS} fois mais je n'arrive pas à corriger l'erreur. Peux-tu me donner plus de détails sur ce que tu attends ?`
-        });
+        envoyer('message', { role: 'ia', content: `J'ai essayé ${MAX_ITERATIONS} fois mais je n'arrive pas à corriger. Peux-tu préciser ce que tu attends ?` });
         envoyer('done', { message: 'Abandon après 3 essais' });
       }
     }
 
     if (annule) envoyer('cancelled', { message: 'Arrêté' });
-
     res.write('event: end\ndata: {}\n\n');
     res.end();
   } catch (error) {
