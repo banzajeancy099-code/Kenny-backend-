@@ -1,10 +1,9 @@
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
-const { createClient } = require('@supabase/supabase-js');
-const { Client } = require('pg'); // NOUVEAU : pour Neon
+const { Client } = require('pg'); // PostgreSQL (Neon)
 
-// NOUVEAUX IMPORTS POUR LE TERMINAL
+// IMPORTS POUR LE TERMINAL
 const antivirus = require('./agents/antivirus');
 const sandbox = require('./agents/sandbox');
 
@@ -18,22 +17,28 @@ app.use(express.json());
 // VARIABLES D'ENVIRONNEMENT
 // ============================================
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
-const SUPABASE_TOKEN = process.env.SUPABASE_TOKEN;
 const RENDER_TOKEN = process.env.RENDER_TOKEN;
 const CLOUDFLARE_TOKEN = process.env.CLOUDFLARE_TOKEN;
 const CLOUDFLARE_AI_TOKEN = process.env.CLOUDFLARE_AI_TOKEN;
-const SUPABASE_ORG_ID = process.env.SUPABASE_ORG_ID;
 const RENDER_OWNER_ID = process.env.RENDER_OWNER_ID;
 const CLOUDFLARE_ACCOUNT_ID = process.env.CLOUDFLARE_ACCOUNT_ID;
 
-// NOUVELLES VARIABLES NEON
+// NEON
 const NEON_API_KEY = process.env.NEON_API_KEY;
 const NEON_CONNECTION_STRING = process.env.NEON_CONNECTION_STRING;
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+// ============================================
+// FONCTION : Connexion à Neon
+// ============================================
+async function getNeonClient() {
+  const client = new Client({
+    connectionString: NEON_CONNECTION_STRING,
+    ssl: { rejectUnauthorized: false }
+  });
+  await client.connect();
+  return client;
+}
 
 // ============================================
 // ROUTE DE TEST
@@ -41,44 +46,23 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 app.get('/', (req, res) => {
   res.json({ 
     message: 'Backend Kenny opérationnel !',
-    supabase: SUPABASE_URL ? '✅ Connecté' : '❌ Manquant',
-    neon: NEON_API_KEY ? '✅ Configuré' : '❌ Manquant'
+    neon: NEON_API_KEY ? '✅ Configuré' : '❌ Manquant',
+    github: GITHUB_TOKEN ? '✅' : '❌',
+    render: RENDER_TOKEN ? '✅' : '❌',
+    cloudflare: CLOUDFLARE_TOKEN ? '✅' : '❌',
+    gemini: GEMINI_API_KEY ? '✅' : '❌'
   });
 });
 
 // ============================================
-// TEST DES AGENTS
-// ============================================
-app.get('/api/agents/test', (req, res) => {
-  res.json({
-    github: GITHUB_TOKEN ? '✅ Configuré' : '❌ Manquant',
-    supabase: SUPABASE_TOKEN ? '✅ Configuré' : '❌ Manquant',
-    render: RENDER_TOKEN ? '✅ Configuré' : '❌ Manquant',
-    cloudflare: CLOUDFLARE_TOKEN ? '✅ Configuré' : '❌ Manquant',
-    image: CLOUDFLARE_AI_TOKEN ? '✅ Configuré' : '❌ Manquant',
-    e2b: process.env.E2B_API_KEY ? '✅ Configuré' : '❌ Manquant',
-    neon_api: NEON_API_KEY ? '✅ Configuré' : '❌ Manquant',
-    neon_db: NEON_CONNECTION_STRING ? '✅ Configuré' : '❌ Manquant'
-  });
-});
-
-// ============================================
-// NOUVELLE ROUTE : TEST NEON
+// TEST NEON (garde l'ancienne route)
 // ============================================
 app.get('/api/neon/test', async (req, res) => {
-  const resultats = {
-    api_key: null,
-    connection_string: null,
-    timestamp: new Date().toISOString()
-  };
+  const resultats = { api_key: null, connection_string: null };
 
-  // 1. TEST API KEY (création de projet)
   try {
     const response = await axios.get('https://console.neon.tech/api/v2/projects', {
-      headers: {
-        'Authorization': `Bearer ${NEON_API_KEY}`,
-        'Accept': 'application/json'
-      }
+      headers: { 'Authorization': `Bearer ${NEON_API_KEY}`, 'Accept': 'application/json' }
     });
     resultats.api_key = {
       success: true,
@@ -86,19 +70,11 @@ app.get('/api/neon/test', async (req, res) => {
       projects: response.data.projects.map(p => ({ id: p.id, name: p.name }))
     };
   } catch (error) {
-    resultats.api_key = {
-      success: false,
-      message: `❌ API Key invalide : ${error.response?.data?.message || error.message}`
-    };
+    resultats.api_key = { success: false, message: `❌ ${error.response?.data?.message || error.message}` };
   }
 
-  // 2. TEST CONNECTION STRING (requête SQL)
   try {
-    const client = new Client({
-      connectionString: NEON_CONNECTION_STRING,
-      ssl: { rejectUnauthorized: false }
-    });
-    await client.connect();
+    const client = await getNeonClient();
     const result = await client.query('SELECT NOW() as now, version() as version');
     await client.end();
     resultats.connection_string = {
@@ -108,19 +84,141 @@ app.get('/api/neon/test', async (req, res) => {
       version: result.rows[0].version.split(' ').slice(0, 2).join(' ')
     };
   } catch (error) {
-    resultats.connection_string = {
-      success: false,
-      message: `❌ Connexion échouée : ${error.message}`
-    };
+    resultats.connection_string = { success: false, message: `❌ ${error.message}` };
   }
 
-  // 3. RÉSULTAT GLOBAL
   resultats.success = resultats.api_key.success && resultats.connection_string.success;
-  resultats.message = resultats.success 
-    ? '🎉 Neon est prêt pour Kenny !' 
-    : '⚠️ Il y a des problèmes à corriger';
-
+  resultats.message = resultats.success ? '🎉 Neon est prêt !' : '⚠️ Problèmes';
   res.json(resultats);
+});
+
+// ============================================
+// NOUVELLE ROUTE : SYNC USER (Firebase → Neon)
+// Appelée après inscription/connexion Firebase
+// ============================================
+app.post('/api/user/sync', async (req, res) => {
+  const { firebase_uid, email, photo_url } = req.body;
+
+  if (!firebase_uid || !email) {
+    return res.status(400).json({ error: 'firebase_uid et email requis' });
+  }
+
+  let client;
+  try {
+    client = await getNeonClient();
+
+    const existing = await client.query(
+      'SELECT id FROM users WHERE firebase_uid = $1',
+      [firebase_uid]
+    );
+
+    let userId;
+    if (existing.rows.length > 0) {
+      userId = existing.rows[0].id;
+      await client.query(
+        'UPDATE users SET last_login = NOW(), email = $1, photo_url = $2 WHERE id = $3',
+        [email, photo_url || null, userId]
+      );
+    } else {
+      const inserted = await client.query(
+        `INSERT INTO users (firebase_uid, email, photo_url) 
+         VALUES ($1, $2, $3) RETURNING id`,
+        [firebase_uid, email, photo_url || null]
+      );
+      userId = inserted.rows[0].id;
+      console.log(`✅ Nouvel utilisateur créé dans Neon : ${email}`);
+    }
+
+    await client.end();
+    res.json({ success: true, user_id: userId, message: '✅ Synchronisé avec Neon' });
+
+  } catch (error) {
+    if (client) await client.end();
+    console.error('Erreur sync user:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
+// NOUVELLE ROUTE : GET USER PROFILE
+// ============================================
+app.get('/api/user/:firebase_uid', async (req, res) => {
+  const { firebase_uid } = req.params;
+  let client;
+  try {
+    client = await getNeonClient();
+    const result = await client.query(
+      'SELECT * FROM users WHERE firebase_uid = $1',
+      [firebase_uid]
+    );
+    await client.end();
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Utilisateur non trouvé' });
+    }
+    res.json({ success: true, user: result.rows[0] });
+  } catch (error) {
+    if (client) await client.end();
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
+// NOUVELLE ROUTE : MÉMOIRE CONVERSATION
+// ============================================
+app.post('/api/memory/save', async (req, res) => {
+  const { firebase_uid, project_id, role, content } = req.body;
+
+  if (!firebase_uid || !role || !content) {
+    return res.status(400).json({ error: 'firebase_uid, role et content requis' });
+  }
+
+  let client;
+  try {
+    client = await getNeonClient();
+    const user = await client.query('SELECT id FROM users WHERE firebase_uid = $1', [firebase_uid]);
+    if (user.rows.length === 0) {
+      await client.end();
+      return res.status(404).json({ error: 'Utilisateur non trouvé' });
+    }
+    await client.query(
+      `INSERT INTO conversation_memory (user_id, project_id, role, content) 
+       VALUES ($1, $2, $3, $4)`,
+      [user.rows[0].id, project_id || null, role, content]
+    );
+    await client.end();
+    res.json({ success: true });
+  } catch (error) {
+    if (client) await client.end();
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/memory/:firebase_uid', async (req, res) => {
+  const { firebase_uid } = req.params;
+  const { project_id, limit = 50 } = req.query;
+  let client;
+  try {
+    client = await getNeonClient();
+    const user = await client.query('SELECT id FROM users WHERE firebase_uid = $1', [firebase_uid]);
+    if (user.rows.length === 0) {
+      await client.end();
+      return res.status(404).json({ error: 'Utilisateur non trouvé' });
+    }
+    let query = 'SELECT * FROM conversation_memory WHERE user_id = $1';
+    const params = [user.rows[0].id];
+    if (project_id) {
+      query += ' AND project_id = $2';
+      params.push(project_id);
+    }
+    query += ` ORDER BY created_at DESC LIMIT $${params.length + 1}`;
+    params.push(parseInt(limit));
+    const result = await client.query(query, params);
+    await client.end();
+    res.json({ success: true, messages: result.rows.reverse() });
+  } catch (error) {
+    if (client) await client.end();
+    res.status(500).json({ error: error.message });
+  }
 });
 
 // ============================================
@@ -128,67 +226,75 @@ app.get('/api/neon/test', async (req, res) => {
 // ============================================
 async function githubAgent(projectName, files) {
   console.log('🤖 GitHub Agent : début');
-  
   try {
     const repoRes = await axios.post(
       'https://api.github.com/user/repos',
-      {
-        name: projectName,
-        private: true,
-        auto_init: false,
-        description: 'App générée par Kenny'
-      },
-      {
-        headers: {
-          'Authorization': `token ${GITHUB_TOKEN}`,
-          'Accept': 'application/vnd.github.v3+json'
-        }
-      }
+      { name: projectName, private: true, auto_init: false, description: 'App générée par Kenny' },
+      { headers: { 'Authorization': `token ${GITHUB_TOKEN}`, 'Accept': 'application/vnd.github.v3+json' } }
     );
-    
     const repo = repoRes.data;
     console.log('✅ Repo créé :', repo.full_name);
-    
     for (const file of files) {
       await axios.put(
         `https://api.github.com/repos/${repo.full_name}/contents/${file.nom}`,
-        {
-          message: `Ajout ${file.nom}`,
-          content: Buffer.from(file.contenu).toString('base64')
-        },
-        {
-          headers: {
-            'Authorization': `token ${GITHUB_TOKEN}`,
-            'Accept': 'application/vnd.github.v3+json'
-          }
-        }
+        { message: `Ajout ${file.nom}`, content: Buffer.from(file.contenu).toString('base64') },
+        { headers: { 'Authorization': `token ${GITHUB_TOKEN}`, 'Accept': 'application/vnd.github.v3+json' } }
       );
       console.log('✅ Fichier push :', file.nom);
     }
-    
-    return {
-      success: true,
-      repo_url: repo.html_url,
-      repo_full_name: repo.full_name,
-      clone_url: repo.clone_url
-    };
-    
+    return { success: true, repo_url: repo.html_url, repo_full_name: repo.full_name, clone_url: repo.clone_url };
   } catch (error) {
-    console.error('❌ GitHub Agent erreur:', error.response?.data || error.message);
-    return {
-      success: false,
-      error: error.response?.data?.message || error.message
-    };
+    console.error('❌ GitHub Agent:', error.response?.data || error.message);
+    return { success: false, error: error.response?.data?.message || error.message };
   }
 }
 
 // ============================================
-// AGENT 2 : SUPABASE (déprécié, remplacé par Neon)
+// AGENT 2 : NEON (remplace Supabase)
 // ============================================
-async function supabaseAgent(projectName) {
-  console.log('🤖 Supabase Agent : début (déprécié)');
-  // On garde la fonction pour compatibilité, mais on utilise Neon
-  return { success: false, error: 'Supabase remplacé par Neon' };
+async function neonAgent(projectName, firebaseUid) {
+  console.log('🤖 Neon Agent : début');
+  try {
+    // Crée un nouveau projet Neon pour l'user
+    const projectRes = await axios.post(
+      'https://console.neon.tech/api/v2/projects',
+      {
+        project: {
+          name: `kenny-${projectName}-${firebaseUid.slice(0, 8)}`,
+          region_id: 'aws-eu-central-1',
+          pg_version: 16
+        }
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${NEON_API_KEY}`,
+          'Content-Type': 'application/json',
+          'Accept': 'application/json'
+        }
+      }
+    );
+
+    const project = projectRes.data.project;
+    console.log('✅ Projet Neon créé :', project.id);
+
+    // Récupérer les connection details
+    const connRes = await axios.get(
+      `https://console.neon.tech/api/v2/projects/${project.id}/connection_uri`,
+      {
+        headers: { 'Authorization': `Bearer ${NEON_API_KEY}`, 'Accept': 'application/json' }
+      }
+    );
+
+    return {
+      success: true,
+      project_id: project.id,
+      connection_uri: connRes.data.uri,
+      project_url: `https://console.neon.tech/app/projects/${project.id}`
+    };
+  } catch (error) {
+    console.error('❌ Neon Agent:', error.response?.data || error.message);
+    return { success: false, error: error.response?.data?.message || error.message };
+  }
 }
 
 // ============================================
@@ -196,7 +302,6 @@ async function supabaseAgent(projectName) {
 // ============================================
 async function renderAgent(projectName, repoUrl) {
   console.log('🤖 Render Agent : début');
-  
   try {
     const serviceRes = await axios.post(
       'https://api.render.com/v1/services',
@@ -211,35 +316,17 @@ async function renderAgent(projectName, repoUrl) {
           env: 'node',
           plan: 'free',
           region: 'frankfurt',
-          envSpecificDetails: {
-            buildCommand: 'npm install',
-            startCommand: 'npm start'
-          }
+          envSpecificDetails: { buildCommand: 'npm install', startCommand: 'npm start' }
         }
       },
-      {
-        headers: {
-          'Authorization': `Bearer ${RENDER_TOKEN}`,
-          'Content-Type': 'application/json'
-        }
-      }
+      { headers: { 'Authorization': `Bearer ${RENDER_TOKEN}`, 'Content-Type': 'application/json' } }
     );
-    
     const service = serviceRes.data;
     console.log('✅ Service Render créé :', service.id);
-    
-    return {
-      success: true,
-      service_id: service.id,
-      service_url: service.serviceDetails?.url
-    };
-    
+    return { success: true, service_id: service.id, service_url: service.serviceDetails?.url };
   } catch (error) {
-    console.error('❌ Render Agent erreur:', error.response?.data || error.message);
-    return {
-      success: false,
-      error: error.response?.data?.message || error.message
-    };
+    console.error('❌ Render Agent:', error.response?.data || error.message);
+    return { success: false, error: error.response?.data?.message || error.message };
   }
 }
 
@@ -248,56 +335,24 @@ async function renderAgent(projectName, repoUrl) {
 // ============================================
 async function cloudflareAgent(domain, targetUrl) {
   console.log('🤖 Cloudflare Agent : début');
-  
   try {
     const zoneRes = await axios.post(
       'https://api.cloudflare.com/client/v4/zones',
-      {
-        name: domain,
-        account: { id: CLOUDFLARE_ACCOUNT_ID },
-        jump_start: true
-      },
-      {
-        headers: {
-          'Authorization': `Bearer ${CLOUDFLARE_TOKEN}`,
-          'Content-Type': 'application/json'
-        }
-      }
+      { name: domain, account: { id: CLOUDFLARE_ACCOUNT_ID }, jump_start: true },
+      { headers: { 'Authorization': `Bearer ${CLOUDFLARE_TOKEN}`, 'Content-Type': 'application/json' } }
     );
-    
     const zone = zoneRes.data.result;
     console.log('✅ Zone créée :', zone.id);
-    
     await axios.post(
       `https://api.cloudflare.com/client/v4/zones/${zone.id}/dns_records`,
-      {
-        type: 'CNAME',
-        name: '@',
-        content: targetUrl,
-        proxied: true
-      },
-      {
-        headers: {
-          'Authorization': `Bearer ${CLOUDFLARE_TOKEN}`,
-          'Content-Type': 'application/json'
-        }
-      }
+      { type: 'CNAME', name: '@', content: targetUrl, proxied: true },
+      { headers: { 'Authorization': `Bearer ${CLOUDFLARE_TOKEN}`, 'Content-Type': 'application/json' } }
     );
-    
     console.log('✅ DNS configuré');
-    
-    return {
-      success: true,
-      zone_id: zone.id,
-      domain: domain
-    };
-    
+    return { success: true, zone_id: zone.id, domain: domain };
   } catch (error) {
-    console.error('❌ Cloudflare Agent erreur:', error.response?.data || error.message);
-    return {
-      success: false,
-      error: error.response?.data?.message || error.message
-    };
+    console.error('❌ Cloudflare Agent:', error.response?.data || error.message);
+    return { success: false, error: error.response?.data?.message || error.message };
   }
 }
 
@@ -306,48 +361,25 @@ async function cloudflareAgent(domain, targetUrl) {
 // ============================================
 async function imageAgent(prompt) {
   console.log('🎨 Image Agent : début');
-  
   try {
     const response = await axios.post(
       `https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/run/@cf/black-forest-labs/flux-1-schnell`,
+      { prompt: prompt, steps: 4 },
       {
-        prompt: prompt,
-        steps: 4
-      },
-      {
-        headers: {
-          'Authorization': `Bearer ${CLOUDFLARE_AI_TOKEN}`,
-          'Content-Type': 'application/json'
-        },
+        headers: { 'Authorization': `Bearer ${CLOUDFLARE_AI_TOKEN}`, 'Content-Type': 'application/json' },
         responseType: 'arraybuffer',
         timeout: 60000
       }
     );
-    
     const base64 = Buffer.from(response.data).toString('base64');
-    const imageUrl = `data:image/png;base64,${base64}`;
-    
-    console.log('✅ Image générée');
-    
-    return {
-      success: true,
-      image_url: imageUrl,
-      prompt: prompt
-    };
-    
+    return { success: true, image_url: `data:image/png;base64,${base64}`, prompt: prompt };
   } catch (error) {
     let errorMsg = error.message;
     if (error.response?.data) {
-      try {
-        const decoder = new TextDecoder();
-        errorMsg = decoder.decode(error.response.data);
-      } catch(e) {}
+      try { errorMsg = new TextDecoder().decode(error.response.data); } catch(e) {}
     }
-    console.error('❌ Image Agent erreur:', errorMsg);
-    return {
-      success: false,
-      error: errorMsg
-    };
+    console.error('❌ Image Agent:', errorMsg);
+    return { success: false, error: errorMsg };
   }
 }
 
@@ -356,31 +388,20 @@ async function imageAgent(prompt) {
 // ============================================
 async function orchestratorDeploy(userId, projectId, projectName, files) {
   console.log('🎯 Orchestrateur : début');
-  
-  const resultats = {
-    github: null,
-    supabase: null,
-    render: null,
-    cloudflare: null,
-    success: false
-  };
-  
+  const resultats = { github: null, neon: null, render: null, cloudflare: null, success: false };
+
   resultats.github = await githubAgent(projectName, files);
   if (!resultats.github.success) return resultats;
-  
-  resultats.supabase = await supabaseAgent(projectName);
+
+  resultats.neon = await neonAgent(projectName, userId || 'anonymous');
   resultats.render = await renderAgent(projectName, resultats.github.clone_url);
-  
-  if (CLOUDFLARE_ACCOUNT_ID) {
-    resultats.cloudflare = await cloudflareAgent(
-      `${projectName}.com`,
-      resultats.render.service_url
-    );
+
+  if (CLOUDFLARE_ACCOUNT_ID && resultats.render.service_url) {
+    resultats.cloudflare = await cloudflareAgent(`${projectName}.com`, resultats.render.service_url);
   }
-  
+
   resultats.success = true;
   console.log('🎉 Orchestrateur : terminé');
-  
   return resultats;
 }
 
@@ -389,29 +410,12 @@ async function orchestratorDeploy(userId, projectId, projectName, files) {
 // ============================================
 app.post('/api/deploy', async (req, res) => {
   const { userId, projectId, projectName, files } = req.body;
-  
-  if (!projectName || !files) {
-    return res.status(400).json({ error: 'projectName et files requis' });
-  }
-  
+  if (!projectName || !files) return res.status(400).json({ error: 'projectName et files requis' });
   console.log('🚀 Déploiement :', projectName);
-  
   try {
     const resultats = await orchestratorDeploy(userId, projectId, projectName, files);
-    
-    if (!resultats.success) {
-      return res.status(500).json({
-        error: 'Échec du déploiement',
-        details: resultats
-      });
-    }
-    
-    res.json({
-      success: true,
-      message: 'App déployée',
-      deployment: resultats
-    });
-    
+    if (!resultats.success) return res.status(500).json({ error: 'Échec du déploiement', details: resultats });
+    res.json({ success: true, message: 'App déployée', deployment: resultats });
   } catch (error) {
     console.error('Erreur deploy:', error);
     res.status(500).json({ error: error.message });
@@ -423,22 +427,12 @@ app.post('/api/deploy', async (req, res) => {
 // ============================================
 app.post('/api/image', async (req, res) => {
   const { prompt } = req.body;
-  
-  if (!prompt) {
-    return res.status(400).json({ error: 'prompt requis' });
-  }
-  
+  if (!prompt) return res.status(400).json({ error: 'prompt requis' });
   console.log('🎨 Génération image :', prompt);
-  
   try {
     const result = await imageAgent(prompt);
-    
-    if (!result.success) {
-      return res.status(500).json({ error: result.error });
-    }
-    
+    if (!result.success) return res.status(500).json({ error: result.error });
     res.json(result);
-    
   } catch (error) {
     console.error('Erreur image:', error);
     res.status(500).json({ error: error.message });
@@ -446,61 +440,20 @@ app.post('/api/image', async (req, res) => {
 });
 
 // ============================================
-// ROUTE : AUTH REGISTER
-// ============================================
-app.post('/api/register', async (req, res) => {
-  const { email, password } = req.body;
-  if (!email || !password) return res.status(400).json({ error: 'Champs requis' });
-  if (password.length < 6) return res.status(400).json({ error: 'Mot de passe trop court' });
-
-  const { data, error } = await supabase.auth.signUp({ email, password });
-  if (error) return res.status(400).json({ error: error.message });
-
-  res.json({ 
-    success: true, 
-    user: { id: data.user.id, email: data.user.email }
-  });
-});
-
-// ============================================
-// ROUTE : AUTH LOGIN
-// ============================================
-app.post('/api/login', async (req, res) => {
-  const { email, password } = req.body;
-  if (!email || !password) return res.status(400).json({ error: 'Champs requis' });
-
-  const { data, error } = await supabase.auth.signInWithPassword({ email, password });
-  if (error) return res.status(401).json({ error: 'Email ou mot de passe incorrect' });
-
-  res.json({ 
-    success: true, 
-    user: { id: data.user.id, email: data.user.email }
-  });
-});
-
-// ============================================
-// ROUTE : CHAT IA
+// ROUTE : CHAT IA (avec mémoire)
 // ============================================
 app.post('/api/chat', async (req, res) => {
-  const { message, history } = req.body;
+  const { message, history, firebase_uid, project_id } = req.body;
   if (!message) return res.status(400).json({ error: 'Message requis' });
-
-  if (!GEMINI_API_KEY) {
-    return res.json({ response: '⚠️ Clé API manquante.', simulated: true });
-  }
+  if (!GEMINI_API_KEY) return res.json({ response: '⚠️ Clé API manquante.', simulated: true });
 
   try {
     const contents = [];
-    
     if (history && Array.isArray(history)) {
       history.forEach(msg => {
-        contents.push({
-          role: msg.role === 'user' ? 'user' : 'model',
-          parts: [{ text: msg.content }]
-        });
+        contents.push({ role: msg.role === 'user' ? 'user' : 'model', parts: [{ text: msg.content }] });
       });
     }
-    
     contents.push({ role: 'user', parts: [{ text: message }] });
 
     const response = await axios.post(
@@ -509,84 +462,70 @@ app.post('/api/chat', async (req, res) => {
         systemInstruction: {
           parts: [{
             text: `Tu es un développeur senior expert en création d'applications.
-
 COMPORTEMENT :
 - Sois parfois gentil, parfois direct.
 - Ne te présente JAMAIS.
 - Réponds en français.
-
 QUESTIONS :
 - Pose 2-4 questions pour comprendre le besoin.
-
 IMAGES :
 - DÈS QUE l'utilisateur décrit une app à créer, ajoute à la FIN de ta réponse :
   [IMAGE: description précise en anglais de l'interface]
-- Exemple :
-  [IMAGE: modern delivery mobile app interface, purple colors, map view, order cards, clean design]
-- Utilise [IMAGE: ...] UNIQUEMENT quand l'utilisateur décrit une app.
-
 CODE :
 - Ne code JAMAIS avant confirmation.
 - Format : \`\`\`html:index.html`
           }]
         },
         contents: contents,
-        generationConfig: {
-          temperature: 0.8,
-          maxOutputTokens: 4000
-        }
+        generationConfig: { temperature: 0.8, maxOutputTokens: 4000 }
       },
-      {
-        headers: { 'Content-Type': 'application/json' },
-        timeout: 180000
-      }
+      { headers: { 'Content-Type': 'application/json' }, timeout: 180000 }
     );
 
     let reponse = response.data.candidates[0].content.parts[0].text;
-    
-    // Détecter [IMAGE: ...]
     let imagePrompt = null;
     const imageMatch = reponse.match(/\[IMAGE:\s*(.+?)\]/i);
-    
     if (imageMatch) {
       imagePrompt = imageMatch[1].trim();
       reponse = reponse.replace(/\[IMAGE:\s*.+?\]/gi, '').trim();
-      console.log('🎨 Image demandée :', imagePrompt);
     }
-    
-    res.json({ 
-      response: reponse,
-      image_prompt: imagePrompt
-    });
 
+    // Sauvegarder dans la mémoire Neon (si user connecté)
+    if (firebase_uid) {
+      try {
+        const client = await getNeonClient();
+        const user = await client.query('SELECT id FROM users WHERE firebase_uid = $1', [firebase_uid]);
+        if (user.rows.length > 0) {
+          await client.query(
+            `INSERT INTO conversation_memory (user_id, project_id, role, content) VALUES ($1, $2, 'user', $3)`,
+            [user.rows[0].id, project_id || null, message]
+          );
+          await client.query(
+            `INSERT INTO conversation_memory (user_id, project_id, role, content) VALUES ($1, $2, 'model', $3)`,
+            [user.rows[0].id, project_id || null, reponse]
+          );
+        }
+        await client.end();
+      } catch (e) { console.log('Mémoire non sauvée:', e.message); }
+    }
+
+    res.json({ response: reponse, image_prompt: imagePrompt });
   } catch (error) {
     console.error('Erreur Gemini:', error.response?.data || error.message);
-    res.status(500).json({ 
-      error: 'Erreur IA',
-      response: `Erreur : ${error.response?.data?.error?.message || error.message}`
-    });
+    res.status(500).json({ error: 'Erreur IA', response: `Erreur : ${error.response?.data?.error?.message || error.message}` });
   }
 });
 
 // ============================================
-// NOUVELLES ROUTES : TERMINAL & SANDBOX
+// ROUTES : TERMINAL & SANDBOX
 // ============================================
 app.post('/api/terminal/exec', async (req, res) => {
   const { commande, mode = 'normal' } = req.body;
   if (!commande) return res.status(400).json({ error: 'Commande vide' });
-
   const cmd = antivirus.nettoyerCommande(commande);
   const verif = antivirus.verifierCommande(cmd, mode);
-
-  if (!verif.allowed) {
-    console.log(`🚫 BLOQUÉ : ${cmd} → ${verif.reason}`);
-    return res.json({ blocked: true, reason: verif.reason, level: verif.level, commande: cmd });
-  }
-
-  if (verif.needsConfirmation) {
-    return res.json({ needsConfirmation: true, reason: verif.reason, commande: cmd });
-  }
-
+  if (!verif.allowed) return res.json({ blocked: true, reason: verif.reason, level: verif.level, commande: cmd });
+  if (verif.needsConfirmation) return res.json({ needsConfirmation: true, reason: verif.reason, commande: cmd });
   console.log(`✅ Exécution : ${cmd}`);
   const result = await sandbox.executerCommande(cmd);
   return res.json({ blocked: false, commande: cmd, ...result });
