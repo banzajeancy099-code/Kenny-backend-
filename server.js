@@ -30,7 +30,6 @@ const GLOBAL_KEYS = {
 };
 
 const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || 'kenny_default_secret_key_2026';
-
 // ============================================
 // 🛡️ WHITELIST AGENT GEMINI (sécurité)
 // ============================================
@@ -264,8 +263,8 @@ app.post('/api/env/test', async (req, res) => {
   const keyUpper = key.toUpperCase();
   try {
     if (keyUpper.includes('GEMINI')) {
-      await axios.post(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${value}`, { contents: [{ role: 'user', parts: [{ text: 'test' }] }] }, { timeout: 10000 });
-      results[key] = '✅ OK';
+  await axios.post(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=${value}`, { contents: [{ role: 'user', parts: [{ text: 'test' }] }] }, { timeout: 10000 });
+  results[key] = '✅ OK';
     } else if (keyUpper.includes('NEON')) {
       await axios.get('https://console.neon.tech/api/v2/projects', { headers: { 'Authorization': `Bearer ${value}` }, timeout: 10000 });
       results[key] = '✅ OK';
@@ -377,7 +376,7 @@ async function creerServiceRender(name, repoUrl, userToken, ownerId, langage = '
   if (!userToken || !ownerId) return { success: false, skipped: true, reason: 'Token Render non configuré' };
   try {
     const serviceName = 'kenny-' + name.toLowerCase().replace(/[^a-z0-9-]/g, '-').substring(0, 40) + '-' + Date.now().toString(36);
-
+    
     let envConfig;
     if (langage === 'python') {
       envConfig = {
@@ -392,23 +391,23 @@ async function creerServiceRender(name, repoUrl, userToken, ownerId, langage = '
         startCommand: 'node server.js'
       };
     }
-
+    
     const res = await axios.post('https://api.render.com/v1/services',
       {
-        type: 'web_service',
-        name: serviceName,
-        ownerId: ownerId,
-        repo: repoUrl,
-        branch: 'main',
+        type: 'web_service', 
+        name: serviceName, 
+        ownerId: ownerId, 
+        repo: repoUrl, 
+        branch: 'main', 
         autoDeploy: 'yes',
-        serviceDetails: {
-          ...envConfig,
-          plan: 'free',
-          region: 'frankfurt',
-          envSpecificDetails: {
-            buildCommand: envConfig.buildCommand,
-            startCommand: envConfig.startCommand
-          }
+        serviceDetails: { 
+          ...envConfig, 
+          plan: 'free', 
+          region: 'frankfurt', 
+          envSpecificDetails: { 
+            buildCommand: envConfig.buildCommand, 
+            startCommand: envConfig.startCommand 
+          } 
         }
       },
       { headers: { 'Authorization': `Bearer ${userToken}`, 'Content-Type': 'application/json', 'Accept': 'application/json' } }
@@ -442,13 +441,13 @@ app.post('/api/workspaces/create', async (req, res) => {
 
     console.log('📦 GitHub...');
     const githubResult = await creerRepoGitHub(project_name, keys.github);
-
+    
     console.log('🗄️ Neon...');
     const neonResult = await creerProjetNeon(project_name);
-
+    
     console.log('🚀 Render...');
     const renderResult = await creerServiceRender(project_name, githubResult.success ? githubResult.clone_url : '', keys.render, keys.renderOwner, 'web');
-
+    
     console.log('🌐 Cloudflare (désactivé)');
     const cloudflareResult = await creerZoneCloudflare(project_name);
 
@@ -486,6 +485,7 @@ app.post('/api/build/full', async (req, res) => {
   const keys = await getKeysForUser(firebase_uid);
   if (!keys.gemini) return res.status(500).json({ error: 'Clé Gemini manquante' });
 
+  // SSE
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
@@ -546,21 +546,23 @@ Génère une application complète et fonctionnelle.`;
     envoyer('status', { message: '🔨 Génération du code complet...' });
 
     const response = await axios.post(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${keys.gemini}`,
-      {
-        systemInstruction: { parts: [{ text: systemPrompt }] },
-        contents: [{ role: 'user', parts: [{ text: prompt }] }],
-        generationConfig: { temperature: 0.7, maxOutputTokens: 8000 }
-      },
-      { headers: { 'Content-Type': 'application/json' }, timeout: 180000 }
-    );
+  `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=${keys.gemini}`,
+  {
+    systemInstruction: { parts: [{ text: systemPrompt }] },
+    contents: [{ role: 'user', parts: [{ text: prompt }] }],
+    generationConfig: { temperature: 0.7, maxOutputTokens: 8000 }
+  },
+  { headers: { 'Content-Type': 'application/json' }, timeout: 180000 }
+);
 
     let reponse = response.data.candidates[0].content.parts[0].text;
-    let blocks = extraireBlocs(reponse);
-
+let blocks = extraireBlocs(reponse);
+    
     envoyer('status', { message: `📦 ${blocks.length} fichiers générés, sauvegarde...` });
 
+    // Sauvegarder dans Neon
     const client = await getNeonClient();
+    const oldFiles = await client.query('SELECT name FROM files WHERE project_id = $1', [project_id]);
     await client.query('DELETE FROM files WHERE project_id = $1', [project_id]);
     for (const file of blocks) {
       await client.query('INSERT INTO files (project_id, name, language, content) VALUES ($1, $2, $3, $4)',
@@ -569,6 +571,7 @@ Génère une application complète et fonctionnelle.`;
     }
     await client.end();
 
+    // Push sur GitHub si workspace existe
     const wsClient = await getNeonClient();
     const ws = await wsClient.query('SELECT * FROM workspaces WHERE project_id = $1', [project_id]);
     await wsClient.end();
@@ -577,9 +580,10 @@ Génère une application complète et fonctionnelle.`;
       envoyer('status', { message: '🐙 Push sur GitHub...' });
       const githubToken = keys.github;
       const repoFullName = ws.rows[0].github_repo;
-
+      
       for (const file of blocks) {
         try {
+          // Vérifier si le fichier existe déjà
           let sha = null;
           try {
             const checkRes = await axios.get(
@@ -605,8 +609,9 @@ Génère une application complète et fonctionnelle.`;
       envoyer('status', { message: '✅ Push GitHub terminé' });
     }
 
+    // Afficher l'URL finale
     const finalUrl = ws.rows[0]?.render_service_url || ws.rows[0]?.github_repo || 'En cours...';
-    envoyer('done', {
+    envoyer('done', { 
       message: '✅ Full Build terminé !',
       url: finalUrl,
       files_count: blocks.length
@@ -666,11 +671,11 @@ function extraireBlocs(text) {
   }
   return blocs;
 }
-
 // ============================================
 // 🔥 FONCTIONS FULL BUILD PYTHON
 // ============================================
 
+// 1. Détecter si le code est Python ou Web
 function detecterLangagePrincipal(blocks) {
   const pyFiles = blocks.filter(b => b.nom.endsWith('.py'));
   const htmlFiles = blocks.filter(b => b.nom.endsWith('.html'));
@@ -678,6 +683,7 @@ function detecterLangagePrincipal(blocks) {
   return 'web';
 }
 
+// 2. Uploader les fichiers dans la sandbox E2B
 async function uploaderDansSandbox(blocks) {
   const sb = await sandbox.creerSandbox();
   for (const block of blocks) {
@@ -695,6 +701,7 @@ async function uploaderDansSandbox(blocks) {
   return sb;
 }
 
+// 3. Tester le code Python dans la sandbox
 async function testerCodePython(blocks) {
   try {
     const sb = await uploaderDansSandbox(blocks);
@@ -806,8 +813,8 @@ except Exception as e:
     return { success: false, stderr: `Erreur interne sandbox :\n${e.message}`, stdout: '', exitCode: 1 };
   }
 }
-
-// ============================================
+    
+    // ============================================
 // 🤖 AGENT GEMINI — Correction autonome avec terminal
 // ============================================
 async function corrigerAvecAgent(blocks, testResult, keys, sandboxInstance) {
@@ -882,7 +889,7 @@ Investigue avec [CMD:], puis corrige avec [FIX].`
     let response;
     try {
       response = await axios.post(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${keys.gemini}`,
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=${keys.gemini}`,
         {
           systemInstruction: { parts: [{ text: agentSystemPrompt }] },
           contents: conversationHistory,
@@ -977,6 +984,7 @@ Investigue avec [CMD:], puis corrige avec [FIX].`
   };
 }
 
+
 // 4. Push GitHub multi-dossiers
 async function pushGitHubMultiDossiers(repoFullName, blocks, githubToken) {
   const results = [];
@@ -990,7 +998,7 @@ async function pushGitHubMultiDossiers(repoFullName, blocks, githubToken) {
         );
         sha = checkRes.data.sha;
       } catch (e) {}
-
+      
       await axios.put(
         `https://api.github.com/repos/${repoFullName}/contents/${file.nom}`,
         {
@@ -1015,6 +1023,7 @@ app.post('/api/build/python', async (req, res) => {
   const { firebase_uid, project_id, prompt } = req.body;
   if (!firebase_uid || !project_id || !prompt) return res.status(400).json({ error: 'Champs requis' });
 
+  // 🔥 Détecter la langue de la demande
   function detecterLangue(texte) {
     const t = texte.toLowerCase();
     if (/\b(créer|crée|calculatrice|application|ajouter|supprimer|modifier|je|tu|il|nous|vous|avec|pour|dans|sur|qui|que|est|sont|une|un|des|le|la|les)\b/.test(t)) return 'français';
@@ -1028,7 +1037,7 @@ app.post('/api/build/python', async (req, res) => {
     if (/[\u3040-\u30FF]/.test(t)) return 'japonais';
     return 'français';
   }
-
+  
   const langue = detecterLangue(prompt);
   console.log(`🌍 Langue détectée : ${langue}`);
   const keys = await getKeysForUser(firebase_uid);
@@ -1067,17 +1076,16 @@ RÈGLES ABSOLUES :
 Génère tout.`;
 
     const response = await axios.post(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${keys.gemini}`,
-      {
-        systemInstruction: { parts: [{ text: systemPrompt }] },
-        contents: [{ role: 'user', parts: [{ text: prompt }] }],
-        generationConfig: { temperature: 0.7, maxOutputTokens: 8000 }
-      },
-      { headers: { 'Content-Type': 'application/json' }, timeout: 180000 }
-    );
-
-    let reponse = response.data.candidates[0].content.parts[0].text;
-    let blocks = extraireBlocs(reponse);
+  `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=${keys.gemini}`,
+  {
+    systemInstruction: { parts: [{ text: systemPrompt }] },
+    contents: contents,
+    generationConfig: { temperature: 0.8, maxOutputTokens: 8000 }
+  },
+  { headers: { 'Content-Type': 'application/json' }, timeout: 180000 }
+);
+   let reponse = response.data.candidates[0].content.parts[0].text;
+let blocks = extraireBlocs(reponse);
     envoyer('status', { message: `📦 ${blocks.length} fichiers générés` });
 
     const client = await getNeonClient();
@@ -1091,96 +1099,96 @@ Génère tout.`;
     }
     await client.end();
 
-    envoyer('status', { message: '🧪 Test du code dans la sandbox...' });
+       envoyer('status', { message: '🧪 Test du code dans la sandbox...' });
     let testResult = await testerCodePython(blocks);
     let essais = 0;
     const MAX_ESSAIS = 3;
 
     while (!testResult.success && essais < MAX_ESSAIS) {
-      essais++;
-      envoyer('status', { message: `🤖 Agent Gemini - tentative ${essais}/${MAX_ESSAIS}...` });
+  essais++;
+  envoyer('status', { message: `🤖 Agent Gemini - tentative ${essais}/${MAX_ESSAIS}...` });
 
-      try {
-        const agentResult = await corrigerAvecAgent(blocks, testResult, keys, testResult.sandbox);
+  try {
+    const agentResult = await corrigerAvecAgent(blocks, testResult, keys, testResult.sandbox);
 
-        for (const log of (agentResult.logsExecution || [])) {
-          envoyer('agent_log', {
-            tour: log.tour,
-            cmd: log.cmd,
-            success: log.success,
-            blocked: log.blocked || false,
-            stdout: log.stdout || '',
-            stderr: log.stderr || '',
-            exitCode: log.exitCode,
-            reason: log.reason || null
-          });
-        }
-
-        if (!agentResult.success) {
-          envoyer('message', {
-            role: 'ia',
-            content: `⚠️ Agent Gemini n'a pas trouvé de correction au tour ${essais}. ${agentResult.error || ''}`
-          });
-          break;
-        }
-
-        if (agentResult.explication) {
-          envoyer('message', {
-            role: 'ia',
-            content: `Tentative ${essais}/${MAX_ESSAIS} : ${agentResult.explication.substring(0, 800)}`
-          });
-        }
-
-        blocks = agentResult.blocks;
-        reponse = agentResult.blocks.map(b => `\`\`\`${b.langage}:${b.nom}\n${b.contenu}\n\`\`\``).join('\n\n');
-
-        const client2 = await getNeonClient();
-        await client2.query('DELETE FROM files WHERE project_id = $1', [project_id]);
-        for (const file of blocks) {
-          await client2.query(
-            'INSERT INTO files (project_id, name, language, content) VALUES ($1, $2, $3, $4)',
-            [project_id, file.nom, file.langage, file.contenu]
-          );
-          envoyer('file', { name: file.nom, language: file.langage, content: file.contenu });
-        }
-        await client2.end();
-
-        testResult = await testerCodePython(blocks);
-      } catch (e) {
-        console.log('Erreur agent:', e.message);
-        envoyer('message', { role: 'ia', content: `Erreur agent : ${e.message}` });
-        break;
-      }
-    }
-
-    if (testResult.success) {
-      envoyer('message', {
-        role: 'ia',
-        content: `✅ Code testé avec succès${essais > 0 ? ` (après ${essais} correction${essais > 1 ? 's' : ''} par l'agent Gemini)` : ''} !\n\nSortie :\n\`\`\`\n${testResult.stdout.substring(0, 500)}\n\`\`\``
-      });
-    } else {
-      envoyer('message', {
-        role: 'ia',
-        content: `⚠️ Le code a été généré mais l'agent Gemini n'a pas réussi à le corriger après ${essais} tentative${essais > 1 ? 's' : ''}. Consultez les logs ci-dessus.`
+    for (const log of (agentResult.logsExecution || [])) {
+      envoyer('agent_log', {
+        tour: log.tour,
+        cmd: log.cmd,
+        success: log.success,
+        blocked: log.blocked || false,
+        stdout: log.stdout || '',
+        stderr: log.stderr || '',
+        exitCode: log.exitCode,
+        reason: log.reason || null
       });
     }
 
+    if (!agentResult.success) {
+      envoyer('message', {
+        role: 'ia',
+        content: `⚠️ Agent Gemini n'a pas trouvé de correction au tour ${essais}. ${agentResult.error || ''}`
+      });
+      break;
+    }
+
+    if (agentResult.explication) {
+      envoyer('message', {
+        role: 'ia',
+        content: `Tentative ${essais}/${MAX_ESSAIS} : ${agentResult.explication.substring(0, 800)}`
+      });
+    }
+
+    blocks = agentResult.blocks;
+    reponse = agentResult.blocks.map(b => `\`\`\`${b.langage}:${b.nom}\n${b.contenu}\n\`\`\``).join('\n\n');
+
+    const client2 = await getNeonClient();
+    await client2.query('DELETE FROM files WHERE project_id = $1', [project_id]);
+    for (const file of blocks) {
+      await client2.query(
+        'INSERT INTO files (project_id, name, language, content) VALUES ($1, $2, $3, $4)',
+        [project_id, file.nom, file.langage, file.contenu]
+      );
+      envoyer('file', { name: file.nom, language: file.langage, content: file.contenu });
+    }
+    await client2.end();
+
+    testResult = await testerCodePython(blocks);
+  } catch (e) {
+    console.log('Erreur agent:', e.message);
+    envoyer('message', { role: 'ia', content: `Erreur agent : ${e.message}` });
+    break;
+  }
+}
+
+if (testResult.success) {
+  envoyer('message', {
+    role: 'ia',
+    content: `✅ Code testé avec succès${essais > 0 ? ` (après ${essais} correction${essais > 1 ? 's' : ''} par l'agent Gemini)` : ''} !\n\nSortie :\n\`\`\`\n${testResult.stdout.substring(0, 500)}\n\`\`\``
+  });
+} else {
+  envoyer('message', {
+    role: 'ia',
+    content: `⚠️ Le code a été généré mais l'agent Gemini n'a pas réussi à le corriger après ${essais} tentative${essais > 1 ? 's' : ''}. Consultez les logs ci-dessus.`
+  });
+}
     const wsClient = await getNeonClient();
-    const ws = await wsClient.query('SELECT * FROM workspaces WHERE project_id = $1', [project_id]);
-    await wsClient.end();
+const ws = await wsClient.query('SELECT * FROM workspaces WHERE project_id = $1', [project_id]);
+await wsClient.end();
 
-    if (ws.rows.length > 0 && ws.rows[0].github_repo) {
-      envoyer('status', { message: '🐙 Push sur GitHub...' });
-      const pushResults = await pushGitHubMultiDossiers(ws.rows[0].github_repo, blocks, keys.github);
-      const reussis = pushResults.filter(r => r.success).length;
-      envoyer('status', { message: `✅ ${reussis}/${pushResults.length} fichiers pushés sur GitHub` });
-    }
+if (ws.rows.length > 0 && ws.rows[0].github_repo) {
+  envoyer('status', { message: '🐙 Push sur GitHub...' });
+  const pushResults = await pushGitHubMultiDossiers(ws.rows[0].github_repo, blocks, keys.github);
+  const reussis = pushResults.filter(r => r.success).length;
+  envoyer('status', { message: `✅ ${reussis}/${pushResults.length} fichiers pushés sur GitHub` });
+}
 
-    const langage = detecterLangagePrincipal(blocks);
-    envoyer('status', { message: `🔤 Langage détecté : ${langage}` });
+// 🔥 Détection du langage et info Render
+const langage = detecterLangagePrincipal(blocks);
+envoyer('status', { message: `🔤 Langage détecté : ${langage}` });
 
     const finalUrl = ws.rows[0]?.render_service_url || ws.rows[0]?.github_repo || 'En cours...';
-    envoyer('done', {
+    envoyer('done', { 
       message: '✅ Build Python terminé !',
       url: finalUrl,
       files_count: blocks.length,
@@ -1196,7 +1204,6 @@ Génère tout.`;
     res.end();
   }
 });
-
 // ============================================
 // CHAT STREAMING (normal)
 // ============================================
@@ -1261,15 +1268,10 @@ ${terminalContext}
 MÉMOIRE :
 ${memoire.join('\n')}`;
 
-      const response = await axios.post(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${keys.gemini}`,
-        {
-          systemInstruction: { parts: [{ text: systemPrompt }] },
-          contents: contents,
-          generationConfig: { temperature: 0.8, maxOutputTokens: 8000 }
-        },
-        { headers: { 'Content-Type': 'application/json' }, timeout: 180000 }
-      );
+        const result = await executerSecurise(cmd);
+  envoyer('terminal_result', { command: cmd, ...result });
+  if (!result.success) { memoire.push(`Erreur install ${cmd}`); installEchouee = true; }
+}
 
       if (annule) break;
 
@@ -1306,10 +1308,15 @@ ${memoire.join('\n')}`;
       for (const cmd of installations) {
         if (annule) break;
         envoyer('terminal', { command: cmd, type: 'install' });
-        const result = await executerSecurise(cmd);
-        envoyer('terminal_result', { command: cmd, ...result });
-        if (!result.success) { memoire.push(`Erreur install ${cmd}`); installEchouee = true; }
-      }
+     const response = await axios.post(
+  `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=${keys.gemini}`,
+  {
+    systemInstruction: { parts: [{ text: systemPrompt }] },
+    contents: [{ role: 'user', parts: [{ text: prompt }] }],
+    generationConfig: { temperature: 0.7, maxOutputTokens: 8000 }
+  },
+  { headers: { 'Content-Type': 'application/json' }, timeout: 180000 }
+);
 
       for (const cmd of commands) {
         if (annule) break;
@@ -1389,14 +1396,14 @@ async function executerSecurise(cmd) {
 app.post('/api/terminal/exec', async (req, res) => {
   const { commande, firebase_uid } = req.body;
   if (!commande) return res.status(400).json({ error: 'Commande vide' });
-
+  
   if (firebase_uid) {
     const quota = await verifierQuota(firebase_uid);
     if (!quota.allowed) {
       return res.json({ blocked: true, reason: quota.error, quota_exceeded: true, plan: quota.plan, used: quota.used, limit: quota.limit });
     }
   }
-
+  
   const result = await executerSecurise(commande);
   return res.json({ ...result, commande });
 });
