@@ -325,14 +325,43 @@ async function creerProjetNeon(name) {
   }
 }
 
-async function creerServiceRender(name, repoUrl, userToken, ownerId) {
+async function creerServiceRender(name, repoUrl, userToken, ownerId, langage = 'web') {
   if (!userToken || !ownerId) return { success: false, skipped: true, reason: 'Token Render non configuré' };
   try {
     const serviceName = 'kenny-' + name.toLowerCase().replace(/[^a-z0-9-]/g, '-').substring(0, 40) + '-' + Date.now().toString(36);
+    
+    let envConfig;
+    if (langage === 'python') {
+      envConfig = {
+        env: 'python',
+        buildCommand: 'pip install -r requirements.txt',
+        startCommand: 'python run.py'
+      };
+    } else {
+      envConfig = {
+        env: 'node',
+        buildCommand: 'npm install',
+        startCommand: 'node server.js'
+      };
+    }
+    
     const res = await axios.post('https://api.render.com/v1/services',
       {
-        type: 'web_service', name: serviceName, ownerId: ownerId, repo: repoUrl, branch: 'main', autoDeploy: 'yes',
-        serviceDetails: { env: 'node', plan: 'free', region: 'frankfurt', envSpecificDetails: { buildCommand: 'npm install', startCommand: 'node server.js' } }
+        type: 'web_service', 
+        name: serviceName, 
+        ownerId: ownerId, 
+        repo: repoUrl, 
+        branch: 'main', 
+        autoDeploy: 'yes',
+        serviceDetails: { 
+          ...envConfig, 
+          plan: 'free', 
+          region: 'frankfurt', 
+          envSpecificDetails: { 
+            buildCommand: envConfig.buildCommand, 
+            startCommand: envConfig.startCommand 
+          } 
+        }
       },
       { headers: { 'Authorization': `Bearer ${userToken}`, 'Content-Type': 'application/json', 'Accept': 'application/json' } }
     );
@@ -341,7 +370,6 @@ async function creerServiceRender(name, repoUrl, userToken, ownerId) {
     return { success: false, error: e.response?.data?.message || e.message };
   }
 }
-
 // 🔥 Cloudflare DÉSACTIVÉ
 async function creerZoneCloudflare(name) {
   return { success: false, skipped: true, reason: 'Cloudflare désactivé temporairement' };
@@ -371,7 +399,7 @@ app.post('/api/workspaces/create', async (req, res) => {
     const neonResult = await creerProjetNeon(project_name);
     
     console.log('🚀 Render...');
-    const renderResult = await creerServiceRender(project_name, githubResult.success ? githubResult.clone_url : '', keys.render, keys.renderOwner);
+    const renderResult = await creerServiceRender(project_name, githubResult.success ? githubResult.clone_url : '', keys.render, keys.renderOwner, 'web');
     
     console.log('🌐 Cloudflare (désactivé)');
     const cloudflareResult = await creerZoneCloudflare(project_name);
@@ -481,9 +509,7 @@ Génère une application complète et fonctionnelle.`;
     );
 
     let reponse = response.data.candidates[0].content.parts[0].text;
-
-    // Extraire les fichiers
-    const blocks = extraireBlocs(reponse);
+let blocks = extraireBlocs(reponse);
     
     envoyer('status', { message: `📦 ${blocks.length} fichiers générés, sauvegarde...` });
 
@@ -710,9 +736,8 @@ Génère tout.`;
       { headers: { 'Content-Type': 'application/json' }, timeout: 180000 }
     );
 
-    let reponse = response.data.candidates[0].content.parts[0].text;
-    const blocks = extraireBlocs(reponse);
-    
+   let reponse = response.data.candidates[0].content.parts[0].text;
+let blocks = extraireBlocs(reponse);
     envoyer('status', { message: `📦 ${blocks.length} fichiers générés` });
 
     const client = await getNeonClient();
@@ -727,30 +752,94 @@ Génère tout.`;
     await client.end();
 
     envoyer('status', { message: '🧪 Test du code dans la sandbox...' });
-    const testResult = await testerCodePython(blocks);
+let testResult = await testerCodePython(blocks);
+let essais = 0;
+const MAX_ESSAIS = 3;
 
-    if (!testResult.success) {
-      envoyer('message', { 
-        role: 'ia', 
-        content: `⚠️ Erreur dans le code :\n\`\`\`\n${testResult.stderr.substring(0, 1000)}\n\`\`\`\n\nLe code a été sauvegardé mais il faudra peut-être le corriger manuellement.`
-      });
-    } else {
-      envoyer('message', { 
-        role: 'ia', 
-        content: `✅ Code testé avec succès !\n\nSortie :\n\`\`\`\n${testResult.stdout.substring(0, 500)}\n\`\`\``
-      });
+while (!testResult.success && essais < MAX_ESSAIS) {
+  essais++;
+  envoyer('status', { message: `🔧 Correction auto (${essais}/${MAX_ESSAIS})...` });
+  envoyer('message', { 
+    role: 'ia', 
+    content: `⚠️ Erreur détectée. Je corrige (tentative ${essais}/${MAX_ESSAIS})...\n\`\`\`\n${testResult.stderr.substring(0, 500)}\n\`\`\``
+  });
+
+  try {
+    const correctionPrompt = `Le code Python suivant a une erreur :
+
+\`\`\`\n${testResult.stderr.substring(0, 1000)}\n\`\`\`
+
+Corrige le code et renvoie TOUS les fichiers avec la même structure :
+- python:moteur/config.py
+- python:moteur/moteur.py
+- python:interface/serveur.py
+- html:templates/index.html
+- json:data/donnees.json
+- txt:requirements.txt
+- python:run.py
+
+Ne change pas la structure, corrige juste l'erreur.`;
+
+    const correctionResponse = await axios.post(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent?key=${keys.gemini}`,
+      {
+        systemInstruction: { parts: [{ text: systemPrompt }] },
+        contents: [
+          { role: 'user', parts: [{ text: prompt }] },
+          { role: 'model', parts: [{ text: reponse }] },
+          { role: 'user', parts: [{ text: correctionPrompt }] }
+        ],
+        generationConfig: { temperature: 0.5, maxOutputTokens: 8000 }
+      },
+      { headers: { 'Content-Type': 'application/json' }, timeout: 180000 }
+    );
+
+    reponse = correctionResponse.data.candidates[0].content.parts[0].text;
+    blocks = extraireBlocs(reponse);
+    
+    const client2 = await getNeonClient();
+    await client2.query('DELETE FROM files WHERE project_id = $1', [project_id]);
+    for (const file of blocks) {
+      await client2.query(
+        'INSERT INTO files (project_id, name, language, content) VALUES ($1, $2, $3, $4)',
+        [project_id, file.nom, file.langage, file.contenu]
+      );
+      envoyer('file', { name: file.nom, language: file.langage, content: file.contenu });
     }
+    await client2.end();
+    
+    testResult = await testerCodePython(blocks);
+  } catch (e) {
+    console.log('Erreur correction:', e.message);
+    break;
+  }
+}
 
+if (testResult.success) {
+  envoyer('message', { 
+    role: 'ia', 
+    content: `✅ Code testé avec succès${essais > 0 ? ` (après ${essais} correction${essais > 1 ? 's' : ''})` : ''} !\n\nSortie :\n\`\`\`\n${testResult.stdout.substring(0, 500)}\n\`\`\``
+  });
+} else {
+  envoyer('message', { 
+    role: 'ia', 
+    content: `⚠️ Le code a été généré mais il y a encore une erreur après ${essais} correction${essais > 1 ? 's' : ''}. Tu peux le corriger manuellement.`
+  });
+}
     const wsClient = await getNeonClient();
-    const ws = await wsClient.query('SELECT * FROM workspaces WHERE project_id = $1', [project_id]);
-    await wsClient.end();
+const ws = await wsClient.query('SELECT * FROM workspaces WHERE project_id = $1', [project_id]);
+await wsClient.end();
 
-    if (ws.rows.length > 0 && ws.rows[0].github_repo) {
-      envoyer('status', { message: '🐙 Push sur GitHub...' });
-      const pushResults = await pushGitHubMultiDossiers(ws.rows[0].github_repo, blocks, keys.github);
-      const reussis = pushResults.filter(r => r.success).length;
-      envoyer('status', { message: `✅ ${reussis}/${pushResults.length} fichiers pushés sur GitHub` });
-    }
+if (ws.rows.length > 0 && ws.rows[0].github_repo) {
+  envoyer('status', { message: '🐙 Push sur GitHub...' });
+  const pushResults = await pushGitHubMultiDossiers(ws.rows[0].github_repo, blocks, keys.github);
+  const reussis = pushResults.filter(r => r.success).length;
+  envoyer('status', { message: `✅ ${reussis}/${pushResults.length} fichiers pushés sur GitHub` });
+}
+
+// 🔥 Détection du langage et info Render
+const langage = detecterLangagePrincipal(blocks);
+envoyer('status', { message: `🔤 Langage détecté : ${langage}` });
 
     const finalUrl = ws.rows[0]?.render_service_url || ws.rows[0]?.github_repo || 'En cours...';
     envoyer('done', { 
