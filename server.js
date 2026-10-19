@@ -1,3 +1,5 @@
+
+
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -14,7 +16,7 @@ app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
 // ============================================
-// VARIABLES GLOBALES (fallback)
+// VARIABLES GLOBALES
 // ============================================
 const GLOBAL_KEYS = {
   gemini: process.env.GEMINI_API_KEY,
@@ -74,15 +76,12 @@ async function getKeysForUser(firebase_uid) {
     const user = await client.query('SELECT id FROM users WHERE firebase_uid = $1', [firebase_uid]);
     if (user.rows.length === 0) { await client.end(); return keys; }
     const userId = user.rows[0].id;
-    
     const envVars = await client.query('SELECT key, value FROM env_variables WHERE user_id = $1', [userId]);
     await client.end();
-    
     for (const row of envVars.rows) {
       const k = row.key.toUpperCase().trim();
       const v = dechiffrer(row.value);
       if (!v) continue;
-      
       if (k === 'GEMINI_API_KEY' || k === 'GEMINI') keys.gemini = v;
       else if (k === 'NEON_API_KEY' || k === 'NEON') keys.neon = v;
       else if (k === 'NEON_CONNECTION_STRING' || k === 'NEON_CONN') keys.neonConn = v;
@@ -94,9 +93,7 @@ async function getKeysForUser(firebase_uid) {
       else if (k === 'RENDER_OWNER_ID' || k === 'RENDER_OWNER') keys.renderOwner = v;
       else if (k === 'E2B_API_KEY' || k === 'E2B') keys.e2b = v;
     }
-  } catch (e) {
-    console.log('Erreur getKeysForUser:', e.message);
-  }
+  } catch (e) {}
   return keys;
 }
 
@@ -110,59 +107,24 @@ async function verifierQuota(firebase_uid) {
       'SELECT id, plan, commands_today, last_command_reset FROM users WHERE firebase_uid = $1',
       [firebase_uid]
     );
-    
-    if (user.rows.length === 0) {
-      await client.end();
-      return { allowed: false, error: 'User non trouvé' };
-    }
-    
+    if (user.rows.length === 0) { await client.end(); return { allowed: false, error: 'User non trouvé' }; }
     const u = user.rows[0];
-    
-    if (u.plan === 'pro' || u.plan === 'premium') {
-      await client.end();
-      return { allowed: true, remaining: '∞', plan: u.plan };
-    }
-    
+    if (u.plan === 'pro' || u.plan === 'premium') { await client.end(); return { allowed: true, remaining: '∞', plan: u.plan }; }
     const today = new Date().toISOString().split('T')[0];
     const lastReset = u.last_command_reset ? u.last_command_reset.toISOString().split('T')[0] : null;
-    
     let commandsToday = u.commands_today || 0;
-    
     if (lastReset !== today) {
       commandsToday = 0;
-      await client.query(
-        'UPDATE users SET commands_today = 0, last_command_reset = $1 WHERE id = $2',
-        [today, u.id]
-      );
+      await client.query('UPDATE users SET commands_today = 0, last_command_reset = $1 WHERE id = $2', [today, u.id]);
     }
-    
     const LIMITE_FREE = 50;
-    
     if (commandsToday >= LIMITE_FREE) {
       await client.end();
-      return { 
-        allowed: false, 
-        error: `Limite atteinte (${LIMITE_FREE} commandes/jour). Passe au plan Pro pour illimité.`,
-        plan: u.plan,
-        used: commandsToday,
-        limit: LIMITE_FREE
-      };
+      return { allowed: false, error: `Limite atteinte (${LIMITE_FREE}/jour). Passe au plan Pro.`, plan: u.plan, used: commandsToday, limit: LIMITE_FREE };
     }
-    
-    await client.query(
-      'UPDATE users SET commands_today = commands_today + 1 WHERE id = $1',
-      [u.id]
-    );
-    
+    await client.query('UPDATE users SET commands_today = commands_today + 1 WHERE id = $1', [u.id]);
     await client.end();
-    return { 
-      allowed: true, 
-      plan: u.plan,
-      used: commandsToday + 1, 
-      limit: LIMITE_FREE,
-      remaining: LIMITE_FREE - commandsToday - 1
-    };
-    
+    return { allowed: true, plan: u.plan, used: commandsToday + 1, limit: LIMITE_FREE, remaining: LIMITE_FREE - commandsToday - 1 };
   } catch (e) {
     return { allowed: false, error: e.message };
   }
@@ -202,7 +164,7 @@ app.post('/api/user/sync', async (req, res) => {
 });
 
 // ============================================
-// ENVIRONNEMENT (env_variables - dynamique)
+// ENVIRONNEMENT
 // ============================================
 app.get('/api/env/load/:firebase_uid', async (req, res) => {
   let client;
@@ -210,16 +172,9 @@ app.get('/api/env/load/:firebase_uid', async (req, res) => {
     client = await getNeonClient();
     const user = await client.query('SELECT id FROM users WHERE firebase_uid = $1', [req.params.firebase_uid]);
     if (user.rows.length === 0) { await client.end(); return res.json({ success: true, variables: [] }); }
-    const result = await client.query(
-      'SELECT key, value FROM env_variables WHERE user_id = $1 ORDER BY created_at ASC',
-      [user.rows[0].id]
-    );
+    const result = await client.query('SELECT key, value FROM env_variables WHERE user_id = $1 ORDER BY created_at ASC', [user.rows[0].id]);
     await client.end();
-    const variables = result.rows.map(r => ({
-      key: r.key,
-      value: r.value ? '••••••••' : ''
-    }));
-    res.json({ success: true, variables });
+    res.json({ success: true, variables: result.rows.map(r => ({ key: r.key, value: r.value ? '••••••••' : '' })) });
   } catch (error) {
     if (client) await client.end();
     res.status(500).json({ error: error.message });
@@ -242,22 +197,12 @@ app.post('/api/env/save', async (req, res) => {
     for (const v of variables) {
       if (!v.key || !v.key.trim()) continue;
       let finalValue = v.value;
-      if (v.value === '••••••••' && oldMap.has(v.key)) {
-        finalValue = oldMap.get(v.key);
-      }
-      let encrypted = null;
-      if (finalValue && finalValue !== '••••••••') {
-        encrypted = chiffrer(finalValue);
-      } else {
-        encrypted = finalValue;
-      }
-      await client.query(
-        'INSERT INTO env_variables (user_id, key, value) VALUES ($1, $2, $3)',
-        [userId, v.key.trim(), encrypted]
-      );
+      if (v.value === '••••••••' && oldMap.has(v.key)) finalValue = oldMap.get(v.key);
+      let encrypted = (finalValue && finalValue !== '••••••••') ? chiffrer(finalValue) : finalValue;
+      await client.query('INSERT INTO env_variables (user_id, key, value) VALUES ($1, $2, $3)', [userId, v.key.trim(), encrypted]);
     }
     await client.end();
-    res.json({ success: true, message: 'Variables sauvegardées' });
+    res.json({ success: true });
   } catch (error) {
     if (client) await client.end();
     res.status(500).json({ error: error.message });
@@ -265,40 +210,28 @@ app.post('/api/env/save', async (req, res) => {
 });
 
 app.post('/api/env/test', async (req, res) => {
-  const { firebase_uid, key, value } = req.body;
-  if (!key || !value) return res.status(400).json({ error: 'key et value requis' });
+  const { key, value } = req.body;
+  if (!key || !value) return res.status(400).json({ error: 'Champs requis' });
   const results = {};
   const keyUpper = key.toUpperCase();
   try {
     if (keyUpper.includes('GEMINI')) {
-      await axios.post(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent?key=${value}`,
-        { contents: [{ role: 'user', parts: [{ text: 'test' }] }] },
-        { timeout: 10000 }
-      );
+      await axios.post(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent?key=${value}`, { contents: [{ role: 'user', parts: [{ text: 'test' }] }] }, { timeout: 10000 });
       results[key] = '✅ OK';
     } else if (keyUpper.includes('NEON')) {
-      await axios.get('https://console.neon.tech/api/v2/projects', {
-        headers: { 'Authorization': `Bearer ${value}` }, timeout: 10000
-      });
+      await axios.get('https://console.neon.tech/api/v2/projects', { headers: { 'Authorization': `Bearer ${value}` }, timeout: 10000 });
       results[key] = '✅ OK';
     } else if (keyUpper.includes('GITHUB')) {
-      await axios.get('https://api.github.com/user', {
-        headers: { 'Authorization': `token ${value}` }, timeout: 10000
-      });
+      await axios.get('https://api.github.com/user', { headers: { 'Authorization': `token ${value}` }, timeout: 10000 });
       results[key] = '✅ OK';
     } else if (keyUpper.includes('CLOUDFLARE')) {
-      await axios.get('https://api.cloudflare.com/client/v4/user/tokens/verify', {
-        headers: { 'Authorization': `Bearer ${value}` }, timeout: 10000
-      });
+      await axios.get('https://api.cloudflare.com/client/v4/user/tokens/verify', { headers: { 'Authorization': `Bearer ${value}` }, timeout: 10000 });
       results[key] = '✅ OK';
     } else if (keyUpper.includes('RENDER')) {
-      await axios.get('https://api.render.com/v1/services?limit=1', {
-        headers: { 'Authorization': `Bearer ${value}` }, timeout: 10000
-      });
+      await axios.get('https://api.render.com/v1/services?limit=1', { headers: { 'Authorization': `Bearer ${value}` }, timeout: 10000 });
       results[key] = '✅ OK';
     } else {
-      results[key] = '⚠️ Type de clé inconnu';
+      results[key] = '⚠️ Type inconnu';
     }
   } catch (e) {
     results[key] = '❌ ' + (e.response?.status || e.message);
@@ -351,13 +284,7 @@ app.get('/api/projects/:project_id/details', async (req, res) => {
     const files = await client.query('SELECT * FROM files WHERE project_id = $1 ORDER BY created_at ASC', [req.params.project_id]);
     const workspace = await client.query('SELECT * FROM workspaces WHERE project_id = $1', [req.params.project_id]);
     await client.end();
-    res.json({ 
-      success: true, 
-      project: project.rows[0], 
-      messages: messages.rows, 
-      files: files.rows,
-      workspace: workspace.rows[0] || null
-    });
+    res.json({ success: true, project: project.rows[0], messages: messages.rows, files: files.rows, workspace: workspace.rows[0] || null });
   } catch (error) {
     if (client) await client.end();
     res.status(500).json({ error: error.message });
@@ -365,13 +292,12 @@ app.get('/api/projects/:project_id/details', async (req, res) => {
 });
 
 // ============================================
-// WORKSPACE AUTO
+// WORKSPACE AUTO (Cloudflare désactivé)
 // ============================================
 async function creerRepoGitHub(name, userToken) {
   try {
     const repoName = 'kenny-' + name.toLowerCase().replace(/[^a-z0-9-]/g, '-').substring(0, 40) + '-' + Date.now().toString(36);
-    const res = await axios.post(
-      'https://api.github.com/user/repos',
+    const res = await axios.post('https://api.github.com/user/repos',
       { name: repoName, private: true, auto_init: true, description: 'App générée par Kenny' },
       { headers: { 'Authorization': `token ${userToken}`, 'Accept': 'application/vnd.github.v3+json' } }
     );
@@ -384,15 +310,13 @@ async function creerRepoGitHub(name, userToken) {
 async function creerProjetNeon(name) {
   try {
     const projectName = 'kenny-' + name.toLowerCase().replace(/[^a-z0-9-]/g, '-').substring(0, 40) + '-' + Date.now().toString(36);
-    const res = await axios.post(
-      'https://console.neon.tech/api/v2/projects',
+    const res = await axios.post('https://console.neon.tech/api/v2/projects',
       { project: { name: projectName, region_id: 'aws-eu-central-1', pg_version: 16 } },
       { headers: { 'Authorization': `Bearer ${GLOBAL_KEYS.neon}`, 'Content-Type': 'application/json', 'Accept': 'application/json' } }
     );
     const projectId = res.data.project.id;
-    // 🔥 CORRECTION : Ajouter ?database_name=neondb
     const connRes = await axios.get(
-      `https://console.neon.tech/api/v2/projects/${projectId}/connection_uri?database_name=neondb`,
+      `https://console.neon.tech/api/v2/projects/${projectId}/connection_uri?database_name=neondb&role_name=neondb_owner`,
       { headers: { 'Authorization': `Bearer ${GLOBAL_KEYS.neon}`, 'Accept': 'application/json' } }
     );
     return { success: true, project_id: projectId, connection_uri: connRes.data.uri };
@@ -402,26 +326,13 @@ async function creerProjetNeon(name) {
 }
 
 async function creerServiceRender(name, repoUrl, userToken, ownerId) {
-  if (!userToken || !ownerId) {
-    return { success: false, skipped: true, reason: 'Token Render non configuré' };
-  }
+  if (!userToken || !ownerId) return { success: false, skipped: true, reason: 'Token Render non configuré' };
   try {
     const serviceName = 'kenny-' + name.toLowerCase().replace(/[^a-z0-9-]/g, '-').substring(0, 40) + '-' + Date.now().toString(36);
-    const res = await axios.post(
-      'https://api.render.com/v1/services',
+    const res = await axios.post('https://api.render.com/v1/services',
       {
-        type: 'web_service',
-        name: serviceName,
-        ownerId: ownerId,
-        repo: repoUrl,
-        branch: 'main',
-        autoDeploy: 'yes',
-        serviceDetails: {
-          env: 'node',
-          plan: 'free',
-          region: 'frankfurt',
-          envSpecificDetails: { buildCommand: 'npm install', startCommand: 'node server.js' }
-        }
+        type: 'web_service', name: serviceName, ownerId: ownerId, repo: repoUrl, branch: 'main', autoDeploy: 'yes',
+        serviceDetails: { env: 'node', plan: 'free', region: 'frankfurt', envSpecificDetails: { buildCommand: 'npm install', startCommand: 'node server.js' } }
       },
       { headers: { 'Authorization': `Bearer ${userToken}`, 'Content-Type': 'application/json', 'Accept': 'application/json' } }
     );
@@ -431,20 +342,9 @@ async function creerServiceRender(name, repoUrl, userToken, ownerId) {
   }
 }
 
+// 🔥 Cloudflare DÉSACTIVÉ
 async function creerZoneCloudflare(name) {
-  try {
-    const subdomain = name.toLowerCase().replace(/[^a-z0-9-]/g, '-').substring(0, 40) + '-' + Date.now().toString(36);
-    const domain = subdomain + '.kenny.app';
-    const zoneRes = await axios.post(
-      'https://api.cloudflare.com/client/v4/zones',
-      { name: domain, account: { id: GLOBAL_KEYS.cloudflareAccount }, jump_start: true },
-      { headers: { 'Authorization': `Bearer ${GLOBAL_KEYS.cloudflare}`, 'Content-Type': 'application/json' } }
-    );
-    if (!zoneRes.data.success) return { success: false, error: JSON.stringify(zoneRes.data.errors) };
-    return { success: true, zone_id: zoneRes.data.result.id, domain };
-  } catch (e) {
-    return { success: false, error: e.response?.data?.errors?.[0]?.message || e.message };
-  }
+  return { success: false, skipped: true, reason: 'Cloudflare désactivé temporairement' };
 }
 
 app.post('/api/workspaces/create', async (req, res) => {
@@ -458,30 +358,22 @@ app.post('/api/workspaces/create', async (req, res) => {
     if (user.rows.length === 0) { await client.end(); return res.status(404).json({ error: 'User non trouvé' }); }
     const userId = user.rows[0].id;
 
-    const ws = await client.query(
-      'INSERT INTO workspaces (project_id, user_id, status) VALUES ($1, $2, $3) RETURNING id',
-      [project_id, userId, 'creating']
-    );
+    const ws = await client.query('INSERT INTO workspaces (project_id, user_id, status) VALUES ($1, $2, $3) RETURNING id', [project_id, userId, 'creating']);
     const workspaceId = ws.rows[0].id;
     await client.end();
 
     const keys = await getKeysForUser(firebase_uid);
 
-    console.log('📦 Création repo GitHub...');
+    console.log('📦 GitHub...');
     const githubResult = await creerRepoGitHub(project_name, keys.github);
     
-    console.log('🗄️ Création projet Neon...');
+    console.log('🗄️ Neon...');
     const neonResult = await creerProjetNeon(project_name);
     
-    console.log('🚀 Création service Render...');
-    const renderResult = await creerServiceRender(
-      project_name,
-      githubResult.success ? githubResult.clone_url : '',
-      keys.render,
-      keys.renderOwner
-    );
+    console.log('🚀 Render...');
+    const renderResult = await creerServiceRender(project_name, githubResult.success ? githubResult.clone_url : '', keys.render, keys.renderOwner);
     
-    console.log('🌐 Création zone Cloudflare...');
+    console.log('🌐 Cloudflare (désactivé)');
     const cloudflareResult = await creerZoneCloudflare(project_name);
 
     const client2 = await getNeonClient();
@@ -497,36 +389,11 @@ app.post('/api/workspaces/create', async (req, res) => {
       githubResult.repo || null, githubResult.clone_url || null,
       neonResult.project_id || null, neonResult.connection_uri || null,
       renderResult.service_id || null, renderResult.service_url || null,
-      cloudflareResult.zone_id || null, cloudflareResult.domain || null,
-      'ready',
-      workspaceId
+      null, null, 'ready', workspaceId
     ]);
     await client2.end();
 
-    res.json({
-      success: true,
-      workspace: {
-        github: githubResult,
-        neon: neonResult,
-        render: renderResult,
-        cloudflare: cloudflareResult
-      }
-    });
-
-  } catch (error) {
-    if (client) await client.end();
-    console.error('Erreur workspace:', error.message);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.get('/api/workspaces/:project_id', async (req, res) => {
-  let client;
-  try {
-    client = await getNeonClient();
-    const result = await client.query('SELECT * FROM workspaces WHERE project_id = $1', [req.params.project_id]);
-    await client.end();
-    res.json({ success: true, workspace: result.rows[0] || null });
+    res.json({ success: true, workspace: { github: githubResult, neon: neonResult, render: renderResult, cloudflare: cloudflareResult } });
   } catch (error) {
     if (client) await client.end();
     res.status(500).json({ error: error.message });
@@ -534,7 +401,376 @@ app.get('/api/workspaces/:project_id', async (req, res) => {
 });
 
 // ============================================
-// CHAT STREAMING
+// 🔥 FULL BUILD — Génération complète
+// ============================================
+app.post('/api/build/full', async (req, res) => {
+  const { firebase_uid, project_id, prompt } = req.body;
+  if (!firebase_uid || !project_id || !prompt) return res.status(400).json({ error: 'Champs requis' });
+
+  const keys = await getKeysForUser(firebase_uid);
+  if (!keys.gemini) return res.status(500).json({ error: 'Clé Gemini manquante' });
+
+  // SSE
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+
+  const envoyer = (type, data) => res.write(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`);
+
+  try {
+    envoyer('status', { message: '🧠 Analyse de la demande...' });
+
+    const systemPrompt = `Tu es un développeur senior expert. Tu vas générer une application COMPLÈTE (Full Build) avec frontend, backend, et base de données.
+
+RÈGLES ABSOLUES :
+
+1. STRUCTURE OBLIGATOIRE :
+   - \`\`\`html:index.html\`\`\` → Le frontend principal
+   - \`\`\`css:style.css\`\`\` → Le CSS
+   - \`\`\`javascript:script.js\`\`\` → Le JS frontend
+   - \`\`\`javascript:server.js\`\`\` → Le backend Express
+   - \`\`\`json:package.json\`\`\` → Les dépendances
+   - \`\`\`markdown:README.md\`\`\` → Documentation
+
+2. BACKEND (server.js) :
+   - Express.js
+   - Routes API : /api/items, /api/users, etc.
+   - Connexion à une base de données (PostgreSQL via pg)
+   - Gestion d'erreurs
+   - Port process.env.PORT || 3000
+
+3. PACKAGE.JSON :
+   - name, version, main, scripts.start, dependencies
+   - Dépendances : express, cors, pg, dotenv
+
+4. FRONTEND :
+   - HTML complet avec toutes les pages (menu, accueil, ajout, etc.)
+   - CSS moderne (Tailwind ou custom)
+   - JS avec fetch vers /api
+   - Pas d'emojis dans le code
+
+5. CHOIX TECHNIQUE :
+   - Si l'app est SIMPLE → Vanilla HTML/CSS/JS + Express
+   - Si l'app est COMPLEXE → React + Express (mais code en HTML/CSS/JS pour compatibilité)
+
+6. FONCTIONNALITÉS COMPLÈTES :
+   - Toutes les pages du menu fonctionnent
+   - Les boutons font de vraies actions
+   - La recherche marche
+   - La base de données est utilisée
+   - Les erreurs sont gérées
+
+7. FORMAT DE SORTIE :
+   - D'abord, explique ce que tu vas construire (2-3 phrases)
+   - Ensuite, génère TOUS les fichiers avec \`\`\`langage:nom_fichier
+   - Ne t'arrête PAS au milieu
+
+Génère une application complète et fonctionnelle.`;
+
+    envoyer('status', { message: '🔨 Génération du code complet...' });
+
+    const response = await axios.post(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent?key=${keys.gemini}`,
+      {
+        systemInstruction: { parts: [{ text: systemPrompt }] },
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        generationConfig: { temperature: 0.7, maxOutputTokens: 8000 }
+      },
+      { headers: { 'Content-Type': 'application/json' }, timeout: 180000 }
+    );
+
+    let reponse = response.data.candidates[0].content.parts[0].text;
+
+    // Extraire les fichiers
+    const blocks = extraireBlocs(reponse);
+    
+    envoyer('status', { message: `📦 ${blocks.length} fichiers générés, sauvegarde...` });
+
+    // Sauvegarder dans Neon
+    const client = await getNeonClient();
+    const oldFiles = await client.query('SELECT name FROM files WHERE project_id = $1', [project_id]);
+    await client.query('DELETE FROM files WHERE project_id = $1', [project_id]);
+    for (const file of blocks) {
+      await client.query('INSERT INTO files (project_id, name, language, content) VALUES ($1, $2, $3, $4)',
+        [project_id, file.nom, file.langage, file.contenu]);
+      envoyer('file', { name: file.nom, language: file.langage, content: file.contenu });
+    }
+    await client.end();
+
+    // Push sur GitHub si workspace existe
+    const wsClient = await getNeonClient();
+    const ws = await wsClient.query('SELECT * FROM workspaces WHERE project_id = $1', [project_id]);
+    await wsClient.end();
+
+    if (ws.rows.length > 0 && ws.rows[0].github_repo) {
+      envoyer('status', { message: '🐙 Push sur GitHub...' });
+      const githubToken = keys.github;
+      const repoFullName = ws.rows[0].github_repo;
+      
+      for (const file of blocks) {
+        try {
+          // Vérifier si le fichier existe déjà
+          let sha = null;
+          try {
+            const checkRes = await axios.get(
+              `https://api.github.com/repos/${repoFullName}/contents/${file.nom}`,
+              { headers: { 'Authorization': `token ${githubToken}`, 'Accept': 'application/vnd.github.v3+json' } }
+            );
+            sha = checkRes.data.sha;
+          } catch (e) {}
+
+          await axios.put(
+            `https://api.github.com/repos/${repoFullName}/contents/${file.nom}`,
+            {
+              message: `Ajout ${file.nom}`,
+              content: Buffer.from(file.contenu).toString('base64'),
+              ...(sha && { sha })
+            },
+            { headers: { 'Authorization': `token ${githubToken}`, 'Accept': 'application/vnd.github.v3+json' } }
+          );
+        } catch (e) {
+          console.log(`Erreur push ${file.nom}:`, e.message);
+        }
+      }
+      envoyer('status', { message: '✅ Push GitHub terminé' });
+    }
+
+    // Afficher l'URL finale
+    const finalUrl = ws.rows[0]?.render_service_url || ws.rows[0]?.github_repo || 'En cours...';
+    envoyer('done', { 
+      message: '✅ Full Build terminé !',
+      url: finalUrl,
+      files_count: blocks.length
+    });
+
+    res.write('event: end\ndata: {}\n\n');
+    res.end();
+
+  } catch (error) {
+    console.error('Erreur full build:', error.message);
+    envoyer('error', { message: error.message });
+    res.end();
+  }
+});
+
+function extraireBlocs(text) {
+  const regex = /```(\w+)(?::([^\n]+))?\n([\s\S]*?)```/g;
+  const blocs = [];
+  let match;
+  while ((match = regex.exec(text)) !== null) {
+    const langage = match[1] || 'code';
+    const nomFichier = match[2] || null;
+    const contenu = match[3].trim();
+    let nom = nomFichier;
+    if (!nom) {
+      const ext = langage === 'html' ? 'html' : langage === 'javascript' || langage === 'js' ? 'js' : langage === 'css' ? 'css' : langage === 'json' ? 'json' : langage === 'markdown' ? 'md' : 'txt';
+      nom = `fichier${blocs.length + 1}.${ext}`;
+    }
+    blocs.push({ langage, nom, contenu });
+  }
+  return blocs;
+}
+// ============================================
+// 🔥 FONCTIONS FULL BUILD PYTHON
+// ============================================
+
+// 1. Détecter si le code est Python ou Web
+function detecterLangagePrincipal(blocks) {
+  const pyFiles = blocks.filter(b => b.nom.endsWith('.py'));
+  const htmlFiles = blocks.filter(b => b.nom.endsWith('.html'));
+  if (pyFiles.length > 0 && pyFiles.length >= htmlFiles.length) return 'python';
+  return 'web';
+}
+
+// 2. Uploader les fichiers dans la sandbox E2B
+async function uploaderDansSandbox(blocks) {
+  const sb = await sandbox.creerSandbox();
+  for (const block of blocks) {
+    try {
+      await sb.filesystem.write(block.nom, block.contenu);
+    } catch (e) {
+      console.log(`Erreur upload ${block.nom}:`, e.message);
+    }
+  }
+  return sb;
+}
+
+// 3. Tester le code Python dans la sandbox
+async function testerCodePython(blocks) {
+  try {
+    const sb = await uploaderDansSandbox(blocks);
+    
+    const mainFile = blocks.find(b => b.nom === 'run.py') 
+                  || blocks.find(b => b.nom === 'main.py')
+                  || blocks.find(b => b.nom === 'app.py');
+    
+    if (!mainFile) {
+      return { success: false, stderr: 'Aucun fichier principal trouvé (run.py, main.py, app.py)' };
+    }
+    
+    const reqFile = blocks.find(b => b.nom === 'requirements.txt');
+    if (reqFile) {
+      await sb.commands.run('pip install -r requirements.txt', { timeoutMs: 60000 });
+    }
+    
+    const result = await sb.commands.run(`python3 ${mainFile.nom}`, { timeoutMs: 30000 });
+    
+    return {
+      success: result.exitCode === 0,
+      stdout: result.stdout || '',
+      stderr: result.stderr || '',
+      exitCode: result.exitCode
+    };
+  } catch (e) {
+    return { success: false, stderr: e.message };
+  }
+}
+
+// 4. Push GitHub multi-dossiers
+async function pushGitHubMultiDossiers(repoFullName, blocks, githubToken) {
+  const results = [];
+  for (const file of blocks) {
+    try {
+      let sha = null;
+      try {
+        const checkRes = await axios.get(
+          `https://api.github.com/repos/${repoFullName}/contents/${file.nom}`,
+          { headers: { 'Authorization': `token ${githubToken}`, 'Accept': 'application/vnd.github.v3+json' } }
+        );
+        sha = checkRes.data.sha;
+      } catch (e) {}
+      
+      await axios.put(
+        `https://api.github.com/repos/${repoFullName}/contents/${file.nom}`,
+        {
+          message: `Ajout ${file.nom}`,
+          content: Buffer.from(file.contenu).toString('base64'),
+          ...(sha && { sha })
+        },
+        { headers: { 'Authorization': `token ${githubToken}`, 'Accept': 'application/vnd.github.v3+json' } }
+      );
+      results.push({ file: file.nom, success: true });
+    } catch (e) {
+      results.push({ file: file.nom, success: false, error: e.message });
+    }
+  }
+  return results;
+}
+
+// ============================================
+// 🔥 ROUTE FULL BUILD PYTHON
+// ============================================
+app.post('/api/build/python', async (req, res) => {
+  const { firebase_uid, project_id, prompt } = req.body;
+  if (!firebase_uid || !project_id || !prompt) return res.status(400).json({ error: 'Champs requis' });
+
+  const keys = await getKeysForUser(firebase_uid);
+  if (!keys.gemini) return res.status(500).json({ error: 'Clé Gemini manquante' });
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+
+  const envoyer = (type, data) => res.write(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`);
+
+  try {
+    envoyer('status', { message: '🧠 Génération du code Python...' });
+
+    const systemPrompt = `Tu es un développeur expert en Python, Flask et data science.
+
+Génère une application COMPLÈTE et FONCTIONNELLE avec cette structure :
+
+- \`\`\`python:moteur/config.py\`\`\` (configuration, seuils)
+- \`\`\`python:moteur/moteur.py\`\`\` (logique principale)
+- \`\`\`python:interface/serveur.py\`\`\` (Flask avec routes API)
+- \`\`\`html:templates/index.html\`\`\` (interface Flask avec {{ }})
+- \`\`\`json:data/donnees.json\`\`\` (données de test)
+- \`\`\`txt:requirements.txt\`\`\` (flask, numpy, scipy)
+- \`\`\`python:run.py\`\`\` (lanceur qui démarre Flask)
+
+RÈGLES ABSOLUES :
+1. Le code doit être COMPLET et fonctionnel
+2. Pas de "..." ni de "TODO"
+3. requirements.txt doit contenir TOUTES les dépendances
+4. run.py doit lancer l'app Flask
+5. Utilise le port 3000 (process.env.PORT || 3000)
+6. N'utilise JAMAIS d'emojis dans le code
+
+Génère tout.`;
+
+    const response = await axios.post(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent?key=${keys.gemini}`,
+      {
+        systemInstruction: { parts: [{ text: systemPrompt }] },
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        generationConfig: { temperature: 0.7, maxOutputTokens: 8000 }
+      },
+      { headers: { 'Content-Type': 'application/json' }, timeout: 180000 }
+    );
+
+    let reponse = response.data.candidates[0].content.parts[0].text;
+    const blocks = extraireBlocs(reponse);
+    
+    envoyer('status', { message: `📦 ${blocks.length} fichiers générés` });
+
+    const client = await getNeonClient();
+    await client.query('DELETE FROM files WHERE project_id = $1', [project_id]);
+    for (const file of blocks) {
+      await client.query(
+        'INSERT INTO files (project_id, name, language, content) VALUES ($1, $2, $3, $4)',
+        [project_id, file.nom, file.langage, file.contenu]
+      );
+      envoyer('file', { name: file.nom, language: file.langage, content: file.contenu });
+    }
+    await client.end();
+
+    envoyer('status', { message: '🧪 Test du code dans la sandbox...' });
+    const testResult = await testerCodePython(blocks);
+
+    if (!testResult.success) {
+      envoyer('message', { 
+        role: 'ia', 
+        content: `⚠️ Erreur dans le code :\n\`\`\`\n${testResult.stderr.substring(0, 1000)}\n\`\`\`\n\nLe code a été sauvegardé mais il faudra peut-être le corriger manuellement.`
+      });
+    } else {
+      envoyer('message', { 
+        role: 'ia', 
+        content: `✅ Code testé avec succès !\n\nSortie :\n\`\`\`\n${testResult.stdout.substring(0, 500)}\n\`\`\``
+      });
+    }
+
+    const wsClient = await getNeonClient();
+    const ws = await wsClient.query('SELECT * FROM workspaces WHERE project_id = $1', [project_id]);
+    await wsClient.end();
+
+    if (ws.rows.length > 0 && ws.rows[0].github_repo) {
+      envoyer('status', { message: '🐙 Push sur GitHub...' });
+      const pushResults = await pushGitHubMultiDossiers(ws.rows[0].github_repo, blocks, keys.github);
+      const reussis = pushResults.filter(r => r.success).length;
+      envoyer('status', { message: `✅ ${reussis}/${pushResults.length} fichiers pushés sur GitHub` });
+    }
+
+    const finalUrl = ws.rows[0]?.render_service_url || ws.rows[0]?.github_repo || 'En cours...';
+    envoyer('done', { 
+      message: '✅ Build Python terminé !',
+      url: finalUrl,
+      files_count: blocks.length,
+      tested: testResult.success
+    });
+
+    res.write('event: end\ndata: {}\n\n');
+    res.end();
+
+  } catch (error) {
+    console.error('Erreur build python:', error.message);
+    envoyer('error', { message: error.message });
+    res.end();
+  }
+});
+// ============================================
+// CHAT STREAMING (normal)
 // ============================================
 app.post('/api/chat/stream', async (req, res) => {
   const { message, history, firebase_uid, project_id, terminal_history } = req.body;
@@ -575,38 +811,22 @@ app.post('/api/chat/stream', async (req, res) => {
       iteration++;
       envoyer('status', { message: `Étape ${iteration}/${MAX_ITERATIONS}...` });
 
-      const systemPrompt = `Tu es un développeur senior expert. Ton caractère est comme ChatGPT : poli, professionnel, clair, pédagogique.
-
-COMPORTEMENT :
-- Tu PARLES et tu CODES EN MÊME TEMPS.
-- Tu annonces chaque étape avec des détails.
-- Tu enchaînes SANS ATTENDRE.
-- Tu ne te présentes JAMAIS.
-- Tu réponds en français.
+      const systemPrompt = `Tu es un développeur senior expert. Ton caractère est comme ChatGPT.
 
 RÈGLES :
+- Tu PARLES et tu CODES EN MÊME TEMPS.
+- Tu ne te présentes JAMAIS.
+- Tu réponds en français.
+- Tu enchaînes SANS ATTENDRE.
 
-1. AUTO-INSTALLATION (ATTENTION) :
-   - AVANT d'installer, VÉRIFIE si déjà présent avec [COMMAND: python3 --version]
+1. AUTO-INSTALLATION :
    - NE FAIS JAMAIS "apt-get update" (bloqué)
    - La sandbox a DÉJÀ : Python 3.13, Node.js, npm, pip, git
-   - Pour installer un paquet Python : [INSTALL: pip install flask]
-   - Pour installer un paquet Node : [INSTALL: npm install react]
+   - [INSTALL: pip install flask] / [INSTALL: npm install react]
 
-2. CODE COMPLET :
-   \`\`\`html:index.html
-   [code]
-   \`\`\`
-   \`\`\`css:style.css
-   [code]
-   \`\`\`
-   \`\`\`javascript:script.js
-   [code]
-   \`\`\`
+2. CODE : HTML/CSS/JS complet
 
-3. IMAGES :
-   - JAMAIS d'emojis dans le code
-   - [IMAGE: description en anglais]
+3. IMAGES : [IMAGE: description en anglais]
 
 ${terminalContext}
 
@@ -660,10 +880,7 @@ ${memoire.join('\n')}`;
         envoyer('terminal', { command: cmd, type: 'install' });
         const result = await executerSecurise(cmd);
         envoyer('terminal_result', { command: cmd, ...result });
-        if (!result.success) {
-          memoire.push(`Erreur install ${cmd}: ${result.stderr || result.reason}`);
-          installEchouee = true;
-        }
+        if (!result.success) { memoire.push(`Erreur install ${cmd}`); installEchouee = true; }
       }
 
       for (const cmd of commands) {
@@ -674,23 +891,15 @@ ${memoire.join('\n')}`;
         if (!result.success && result.stderr) memoire.push(`Erreur ${cmd}: ${result.stderr}`);
       }
 
-      if (installEchouee) {
-        memoire = memoire.filter(m => !m.includes('Erreur install'));
-      }
+      if (installEchouee) memoire = memoire.filter(m => !m.includes('Erreur install'));
 
       if (firebase_uid) {
         try {
           const client = await getNeonClient();
           const user = await client.query('SELECT id FROM users WHERE firebase_uid = $1', [firebase_uid]);
           if (user.rows.length > 0) {
-            await client.query(
-              `INSERT INTO conversation_memory (user_id, project_id, role, content) VALUES ($1, $2, 'user', $3)`,
-              [user.rows[0].id, project_id, message]
-            );
-            await client.query(
-              `INSERT INTO conversation_memory (user_id, project_id, role, content) VALUES ($1, $2, 'model', $3)`,
-              [user.rows[0].id, project_id, reponse]
-            );
+            await client.query(`INSERT INTO conversation_memory (user_id, project_id, role, content) VALUES ($1, $2, 'user', $3)`, [user.rows[0].id, project_id, message]);
+            await client.query(`INSERT INTO conversation_memory (user_id, project_id, role, content) VALUES ($1, $2, 'model', $3)`, [user.rows[0].id, project_id, reponse]);
           }
           await client.end();
         } catch (e) {}
@@ -705,10 +914,7 @@ ${memoire.join('\n')}`;
           for (const file of blocks) fileMap.set(file.nom, { nom: file.nom, langage: file.langage, contenu: file.contenu });
           await client.query('DELETE FROM files WHERE project_id = $1', [project_id]);
           for (const f of fileMap.values()) {
-            await client.query(
-              'INSERT INTO files (project_id, name, language, content) VALUES ($1, $2, $3, $4)',
-              [project_id, f.nom, f.langage, f.contenu]
-            );
+            await client.query('INSERT INTO files (project_id, name, language, content) VALUES ($1, $2, $3, $4)', [project_id, f.nom, f.langage, f.contenu]);
           }
           await client.end();
         } catch (e) {}
@@ -724,8 +930,8 @@ ${memoire.join('\n')}`;
         contents.push({ role: 'model', parts: [{ text: reponse }] });
         contents.push({ role: 'user', parts: [{ text: `Erreurs :\n${memoire.join('\n')}\n\nCorrige.` }] });
       } else {
-        envoyer('message', { role: 'ia', content: `J'ai essayé ${MAX_ITERATIONS} fois mais je n'arrive pas à corriger. Peux-tu préciser ce que tu attends ?` });
-        envoyer('done', { message: 'Abandon après 3 essais' });
+        envoyer('message', { role: 'ia', content: `J'ai essayé ${MAX_ITERATIONS} fois. Précise ce que tu attends.` });
+        envoyer('done', { message: 'Abandon' });
       }
     }
 
@@ -733,7 +939,6 @@ ${memoire.join('\n')}`;
     res.write('event: end\ndata: {}\n\n');
     res.end();
   } catch (error) {
-    console.error('Erreur stream:', error.message);
     envoyer('error', { message: error.message });
     res.end();
   }
@@ -750,24 +955,6 @@ async function executerSecurise(cmd) {
   }
 }
 
-function extraireBlocs(text) {
-  const regex = /```(\w+)(?::([^\n]+))?\n([\s\S]*?)```/g;
-  const blocs = [];
-  let match;
-  while ((match = regex.exec(text)) !== null) {
-    const langage = match[1] || 'code';
-    const nomFichier = match[2] || null;
-    const contenu = match[3].trim();
-    let nom = nomFichier;
-    if (!nom) {
-      const ext = langage === 'html' ? 'html' : langage === 'javascript' || langage === 'js' ? 'js' : langage === 'css' ? 'css' : 'txt';
-      nom = `fichier${blocs.length + 1}.${ext}`;
-    }
-    blocs.push({ langage, nom, contenu });
-  }
-  return blocs;
-}
-
 // ============================================
 // TERMINAL (avec quota)
 // ============================================
@@ -778,14 +965,7 @@ app.post('/api/terminal/exec', async (req, res) => {
   if (firebase_uid) {
     const quota = await verifierQuota(firebase_uid);
     if (!quota.allowed) {
-      return res.json({ 
-        blocked: true, 
-        reason: quota.error,
-        quota_exceeded: true,
-        plan: quota.plan,
-        used: quota.used,
-        limit: quota.limit
-      });
+      return res.json({ blocked: true, reason: quota.error, quota_exceeded: true, plan: quota.plan, used: quota.used, limit: quota.limit });
     }
   }
   
@@ -804,29 +984,15 @@ app.post('/api/terminal/close', async (req, res) => {
 app.get('/api/quota/:firebase_uid', async (req, res) => {
   try {
     const client = await getNeonClient();
-    const user = await client.query(
-      'SELECT plan, commands_today, last_command_reset FROM users WHERE firebase_uid = $1',
-      [req.params.firebase_uid]
-    );
+    const user = await client.query('SELECT plan, commands_today, last_command_reset FROM users WHERE firebase_uid = $1', [req.params.firebase_uid]);
     await client.end();
-    
-    if (user.rows.length === 0) {
-      return res.json({ success: false, error: 'User non trouvé' });
-    }
-    
+    if (user.rows.length === 0) return res.json({ success: false });
     const u = user.rows[0];
     const LIMITE_FREE = 50;
     const today = new Date().toISOString().split('T')[0];
     const lastReset = u.last_command_reset ? u.last_command_reset.toISOString().split('T')[0] : null;
     const commandsToday = lastReset === today ? (u.commands_today || 0) : 0;
-    
-    res.json({
-      success: true,
-      plan: u.plan || 'free',
-      used: commandsToday,
-      limit: LIMITE_FREE,
-      remaining: Math.max(0, LIMITE_FREE - commandsToday)
-    });
+    res.json({ success: true, plan: u.plan || 'free', used: commandsToday, limit: LIMITE_FREE, remaining: Math.max(0, LIMITE_FREE - commandsToday) });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
