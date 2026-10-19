@@ -1268,7 +1268,7 @@ ${terminalContext}
 MÉMOIRE :
 ${memoire.join('\n')}`;
 
-        const result = await executerSecurise(cmd);
+                const result = await executerSecurise(cmd);
   envoyer('terminal_result', { command: cmd, ...result });
   if (!result.success) { memoire.push(`Erreur install ${cmd}`); installEchouee = true; }
 }
