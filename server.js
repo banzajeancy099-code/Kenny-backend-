@@ -586,14 +586,41 @@ function extraireBlocs(text) {
   let match;
   while ((match = regex.exec(text)) !== null) {
     const langage = match[1] || 'code';
-    const nomFichier = match[2] || null;
+    const nomFichier = match[2] ? match[2].trim() : null;
     const contenu = match[3].trim();
+
     let nom = nomFichier;
     if (!nom) {
-      const ext = langage === 'html' ? 'html' : langage === 'javascript' || langage === 'js' ? 'js' : langage === 'css' ? 'css' : langage === 'json' ? 'json' : langage === 'markdown' ? 'md' : 'txt';
-      nom = `fichier${blocs.length + 1}.${ext}`;
+      if (contenu.includes('from flask import') || contenu.includes('import flask')) {
+        nom = 'app.py';
+      } else if (contenu.includes('if __name__ ==')) {
+        nom = 'run.py';
+      } else {
+        const ext = langage === 'html' ? 'html'
+          : langage === 'javascript' || langage === 'js' ? 'js'
+          : langage === 'css' ? 'css'
+          : langage === 'json' ? 'json'
+          : langage === 'python' || langage === 'py' ? 'py'
+          : langage === 'markdown' ? 'md'
+          : langage === 'txt' ? 'txt'
+          : 'txt';
+        nom = `fichier${blocs.length + 1}.${ext}`;
+      }
     }
-    blocs.push({ langage, nom, contenu });
+
+    nom = nom.replace(/^[\s:]+|[\s:]+$/g, '').replace(/\s+/g, '_');
+
+    let finalNom = nom;
+    let counter = 1;
+    while (blocs.some(b => b.nom === finalNom)) {
+      const dot = nom.lastIndexOf('.');
+      finalNom = dot > 0
+        ? `${nom.substring(0, dot)}_${counter}${nom.substring(dot)}`
+        : `${nom}_${counter}`;
+      counter++;
+    }
+
+    blocs.push({ langage, nom: finalNom, contenu });
   }
   return blocs;
 }
@@ -614,6 +641,11 @@ async function uploaderDansSandbox(blocks) {
   const sb = await sandbox.creerSandbox();
   for (const block of blocks) {
     try {
+      const parts = block.nom.split('/');
+      if (parts.length > 1) {
+        const dirPath = parts.slice(0, -1).join('/');
+        await sb.commands.run(`mkdir -p "${dirPath}"`, { timeoutMs: 5000 });
+      }
       await sb.filesystem.write(block.nom, block.contenu);
     } catch (e) {
       console.log(`Erreur upload ${block.nom}:`, e.message);
@@ -626,27 +658,79 @@ async function uploaderDansSandbox(blocks) {
 async function testerCodePython(blocks) {
   try {
     const sb = await uploaderDansSandbox(blocks);
-    
-    const mainFile = blocks.find(b => b.nom === 'run.py') 
+
+    const mainFile = blocks.find(b => b.nom === 'run.py')
                   || blocks.find(b => b.nom === 'main.py')
                   || blocks.find(b => b.nom === 'app.py');
-    
+
     if (!mainFile) {
       return { success: false, stderr: 'Aucun fichier principal trouvé (run.py, main.py, app.py)' };
     }
-    
+
     const reqFile = blocks.find(b => b.nom === 'requirements.txt');
     if (reqFile) {
-      await sb.commands.run('pip install -r requirements.txt', { timeoutMs: 60000 });
+      const installResult = await sb.commands.run('pip install -r requirements.txt 2>&1', { timeoutMs: 120000 });
+      if (installResult.exitCode !== 0) {
+        return {
+          success: false,
+          stdout: installResult.stdout || '',
+          stderr: `Échec pip install :\n${(installResult.stderr || installResult.stdout || '').substring(0, 2000)}`,
+          exitCode: installResult.exitCode
+        };
+      }
     }
-    
-    const result = await sb.commands.run(`python3 ${mainFile.nom}`, { timeoutMs: 30000 });
-    
+
+    const syntaxCheck = await sb.commands.run(
+      `python3 -m py_compile ${mainFile.nom} 2>&1`,
+      { timeoutMs: 15000 }
+    );
+    if (syntaxCheck.exitCode !== 0) {
+      return {
+        success: false,
+        stdout: syntaxCheck.stdout || '',
+        stderr: `Erreur de syntaxe :\n${(syntaxCheck.stderr || syntaxCheck.stdout || '').substring(0, 2000)}`,
+        exitCode: syntaxCheck.exitCode
+      };
+    }
+
+    const allPyFiles = blocks.filter(b => b.nom.endsWith('.py')).map(b => b.nom);
+    if (allPyFiles.length > 1) {
+      const pyCompile = await sb.commands.run(
+        `python3 -m py_compile ${allPyFiles.join(' ')} 2>&1`,
+        { timeoutMs: 20000 }
+      );
+      if (pyCompile.exitCode !== 0) {
+        return {
+          success: false,
+          stdout: pyCompile.stdout || '',
+          stderr: `Erreur de syntaxe dans un fichier :\n${(pyCompile.stderr || pyCompile.stdout || '').substring(0, 2000)}`,
+          exitCode: pyCompile.exitCode
+        };
+      }
+    }
+
+    const runTest = await sb.commands.run(
+      `timeout 5 python3 ${mainFile.nom} > /tmp/run.log 2>&1; echo "EXIT:$?"; cat /tmp/run.log`,
+      { timeoutMs: 15000 }
+    );
+
+    const log = runTest.stdout || '';
+    const crashImmediat = log.includes('Traceback') && !log.includes('EXIT:124');
+
+    if (crashImmediat && !log.includes('EXIT:124')) {
+      return {
+        success: false,
+        stdout: log,
+        stderr: `Crash au démarrage :\n${log.substring(0, 2000)}`,
+        exitCode: runTest.exitCode
+      };
+    }
+
     return {
-      success: result.exitCode === 0,
-      stdout: result.stdout || '',
-      stderr: result.stderr || '',
-      exitCode: result.exitCode
+      success: true,
+      stdout: `✅ Tous les tests passent.\n${log.substring(0, 500)}`,
+      stderr: '',
+      exitCode: 0
     };
   } catch (e) {
     return { success: false, stderr: e.message };
@@ -691,6 +775,23 @@ app.post('/api/build/python', async (req, res) => {
   const { firebase_uid, project_id, prompt } = req.body;
   if (!firebase_uid || !project_id || !prompt) return res.status(400).json({ error: 'Champs requis' });
 
+  // 🔥 Détecter la langue de la demande
+  function detecterLangue(texte) {
+    const t = texte.toLowerCase();
+    if (/\b(créer|crée|calculatrice|application|ajouter|supprimer|modifier|je|tu|il|nous|vous|avec|pour|dans|sur|qui|que|est|sont|une|un|des|le|la|les)\b/.test(t)) return 'français';
+    if (/\b(create|crear|bere|make|build|calculate|app|add|remove|edit|with|for|in|on|who|that|is|are|a|an|the)\b/.test(t)) return 'anglais';
+    if (/\b(crear|calculadora|aplicación|agregar|eliminar|modificar|yo|tú|él|nosotros|con|para|en|sobre|que|es|son|una|un|los|las)\b/.test(t)) return 'espagnol';
+    if (/\b(erstelle|rechner|anwendung|hinzufügen|entfernen|bearbeiten|mit|für|in|auf|wer|das|ist|sind|ein|eine|der|die|das)\b/.test(t)) return 'allemand';
+    if (/\b(criar|calculadora|aplicativo|adicionar|remover|editar|com|para|em|sobre|quem|que|é|são|um|uma|os|as)\b/.test(t)) return 'portugais';
+    if (/\b(creare|calcolatrice|applicazione|aggiungere|rimuovere|modificare|con|per|in|su|chi|che|è|sono|un|una|i|le)\b/.test(t)) return 'italien';
+    if (/[\u0600-\u06FF]/.test(t)) return 'arabe';
+    if (/[\u4E00-\u9FFF]/.test(t)) return 'chinois';
+    if (/[\u3040-\u30FF]/.test(t)) return 'japonais';
+    return 'français';
+  }
+  
+  const langue = detecterLangue(prompt);
+  console.log(`🌍 Langue détectée : ${langue}`);
   const keys = await getKeysForUser(firebase_uid);
   if (!keys.gemini) return res.status(500).json({ error: 'Clé Gemini manquante' });
 
@@ -751,25 +852,47 @@ let blocks = extraireBlocs(reponse);
     }
     await client.end();
 
-    envoyer('status', { message: '🧪 Test du code dans la sandbox...' });
-let testResult = await testerCodePython(blocks);
-let essais = 0;
-const MAX_ESSAIS = 3;
+       envoyer('status', { message: '🧪 Test du code dans la sandbox...' });
+    let testResult = await testerCodePython(blocks);
+    let essais = 0;
+    const MAX_ESSAIS = 3;
 
-while (!testResult.success && essais < MAX_ESSAIS) {
-  essais++;
-  envoyer('status', { message: `🔧 Correction auto (${essais}/${MAX_ESSAIS})...` });
-  envoyer('message', { 
-    role: 'ia', 
-    content: `⚠️ Erreur détectée. Je corrige (tentative ${essais}/${MAX_ESSAIS})...\n\`\`\`\n${testResult.stderr.substring(0, 500)}\n\`\`\``
-  });
+    while (!testResult.success && essais < MAX_ESSAIS) {
+      essais++;
+      envoyer('status', { message: `🔧 Correction auto (${essais}/${MAX_ESSAIS})...` });
 
-  try {
-    const correctionPrompt = `Le code Python suivant a une erreur :
+      try {
+        let fichiersActuels = '';
+        for (const file of blocks) {
+          fichiersActuels += `\n=== ${file.nom} ===\n${file.contenu}\n`;
+        }
 
-\`\`\`\n${testResult.stderr.substring(0, 1000)}\n\`\`\`
+        const correctionPrompt = `Voici le code Python actuel qui a une erreur :
 
-Corrige le code et renvoie TOUS les fichiers avec la même structure :
+${fichiersActuels}
+
+ERREUR EXACTE (sortie de la sandbox) :
+\`\`\`
+${testResult.stderr}
+\`\`\`
+
+TA MISSION (dans cet ordre) :
+
+1. EXPLIQUE D'ABORD L'ERREUR EN FRANÇAIS :
+   - Quelle est la cause ?
+   - Quelle ligne est concernée ?
+   - Pourquoi ça ne marche pas ?
+
+2. ENSUITE, CORRIGE LE CODE :
+   - Renvoie TOUS les fichiers corrigés
+   - Format : \`\`\`python:nom_fichier
+
+3. VÉRIFIE :
+   - Tous les imports sont corrects
+   - requirements.txt contient TOUTES les dépendances
+   - Le code est complet et fonctionnel
+
+STRUCTURE À RESPECTER :
 - python:moteur/config.py
 - python:moteur/moteur.py
 - python:interface/serveur.py
@@ -778,54 +901,64 @@ Corrige le code et renvoie TOUS les fichiers avec la même structure :
 - txt:requirements.txt
 - python:run.py
 
-Ne change pas la structure, corrige juste l'erreur.`;
+IMPORTANT :
+1. Ne change PAS la structure des dossiers
+2. Vérifie que TOUS les imports sont corrects
+3. Vérifie que requirements.txt contient TOUTES les dépendances
+4. Le code doit être complet et fonctionnel
+5. Si le code est cassé, réécris-le complètement`;
 
-    const correctionResponse = await axios.post(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent?key=${keys.gemini}`,
-      {
-        systemInstruction: { parts: [{ text: systemPrompt }] },
-        contents: [
-          { role: 'user', parts: [{ text: prompt }] },
-          { role: 'model', parts: [{ text: reponse }] },
-          { role: 'user', parts: [{ text: correctionPrompt }] }
-        ],
-        generationConfig: { temperature: 0.5, maxOutputTokens: 8000 }
-      },
-      { headers: { 'Content-Type': 'application/json' }, timeout: 180000 }
-    );
+        const correctionResponse = await axios.post(
+          `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent?key=${keys.gemini}`,
+          {
+            systemInstruction: { parts: [{ text: systemPrompt }] },
+            contents: [
+              { role: 'user', parts: [{ text: prompt }] },
+              { role: 'model', parts: [{ text: reponse }] },
+              { role: 'user', parts: [{ text: correctionPrompt }] }
+            ],
+            generationConfig: { temperature: 0.5, maxOutputTokens: 8000 }
+          },
+          { headers: { 'Content-Type': 'application/json' }, timeout: 180000 }
+        );
 
-    reponse = correctionResponse.data.candidates[0].content.parts[0].text;
-    blocks = extraireBlocs(reponse);
-    
-    const client2 = await getNeonClient();
-    await client2.query('DELETE FROM files WHERE project_id = $1', [project_id]);
-    for (const file of blocks) {
-      await client2.query(
-        'INSERT INTO files (project_id, name, language, content) VALUES ($1, $2, $3, $4)',
-        [project_id, file.nom, file.langage, file.contenu]
-      );
-      envoyer('file', { name: file.nom, language: file.langage, content: file.contenu });
+        reponse = correctionResponse.data.candidates[0].content.parts[0].text;
+        blocks = extraireBlocs(reponse);
+
+        const explication = reponse.replace(/```[\s\S]*?```/g, '').trim();
+        if (explication) {
+          envoyer('message', { role: 'ia', content: `Tentative ${essais}/${MAX_ESSAIS} : ${explication.substring(0, 800)}` });
+        }
+
+        const client2 = await getNeonClient();
+        await client2.query('DELETE FROM files WHERE project_id = $1', [project_id]);
+        for (const file of blocks) {
+          await client2.query(
+            'INSERT INTO files (project_id, name, language, content) VALUES ($1, $2, $3, $4)',
+            [project_id, file.nom, file.langage, file.contenu]
+          );
+          envoyer('file', { name: file.nom, language: file.langage, content: file.contenu });
+        }
+        await client2.end();
+
+        testResult = await testerCodePython(blocks);
+      } catch (e) {
+        console.log('Erreur correction:', e.message);
+        break;
+      }
     }
-    await client2.end();
-    
-    testResult = await testerCodePython(blocks);
-  } catch (e) {
-    console.log('Erreur correction:', e.message);
-    break;
-  }
-}
 
-if (testResult.success) {
-  envoyer('message', { 
-    role: 'ia', 
-    content: `✅ Code testé avec succès${essais > 0 ? ` (après ${essais} correction${essais > 1 ? 's' : ''})` : ''} !\n\nSortie :\n\`\`\`\n${testResult.stdout.substring(0, 500)}\n\`\`\``
-  });
-} else {
-  envoyer('message', { 
-    role: 'ia', 
-    content: `⚠️ Le code a été généré mais il y a encore une erreur après ${essais} correction${essais > 1 ? 's' : ''}. Tu peux le corriger manuellement.`
-  });
-}
+    if (testResult.success) {
+      envoyer('message', {
+        role: 'ia',
+        content: `✅ Code testé avec succès${essais > 0 ? ` (après ${essais} correction${essais > 1 ? 's' : ''})` : ''} !\n\nSortie :\n\`\`\`\n${testResult.stdout.substring(0, 500)}\n\`\`\``
+      });
+    } else {
+      envoyer('message', {
+        role: 'ia',
+        content: `⚠️ Le code a été généré mais il y a encore une erreur après ${essais} correction${essais > 1 ? 's' : ''}. Tu peux le corriger manuellement.`
+      });
+    }
     const wsClient = await getNeonClient();
 const ws = await wsClient.query('SELECT * FROM workspaces WHERE project_id = $1', [project_id]);
 await wsClient.end();
@@ -1092,4 +1225,4 @@ app.get('/api/quota/:firebase_uid', async (req, res) => {
 // ============================================
 app.listen(PORT, () => {
   console.log('Kenny serveur sur le port ' + PORT);
-});
+}); 
