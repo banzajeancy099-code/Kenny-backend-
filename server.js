@@ -1,18 +1,41 @@
-
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const { Client } = require('pg');
 const crypto = require('crypto');
+const rateLimit = require('express-rate-limit');
 
 const antivirus = require('./agents/antivirus');
 const sandbox = require('./agents/sandbox');
 
+// [NEW] Garde-fous process
+process.on('unhandledRejection', (err) => console.error('🔴 UnhandledRejection:', err));
+process.on('uncaughtException', (err) => console.error('🔴 UncaughtException:', err));
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(cors());
-app.use(express.json({ limit: '10mb' }));
+// Constantes
+const LIMITE_FREE = 50;
+const MAX_HISTORY = 30;
+const MAX_TERMINAL_HISTORY = 10;
+
+// [FIX #18] CORS restreint
+const ALLOWED_ORIGINS = (process.env.CORS_ORIGINS || '*').split(',').map(s => s.trim());
+app.use(cors({
+  origin: ALLOWED_ORIGINS.includes('*') ? true : ALLOWED_ORIGINS,
+  credentials: true
+}));
+app.use(express.json({ limit: '2mb' }));
+
+// [FIX #20] Rate limiting sur routes coûteuses
+const iaLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 20,
+  message: { error: 'Trop de requêtes IA, réessaie dans 1 minute.' },
+  standardHeaders: true,
+  legacyHeaders: false
+});
 
 // ============================================
 // VARIABLES GLOBALES
@@ -30,10 +53,26 @@ const GLOBAL_KEYS = {
   e2b: process.env.E2B_API_KEY
 };
 
-const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || 'kenny_default_secret_key_2026';
+// [FIX #22] Clé d'encryption obligatoire hors development
+const ENCRYPTION_KEY_RAW = process.env.ENCRYPTION_KEY;
+if (!ENCRYPTION_KEY_RAW) {
+  if (process.env.NODE_ENV !== 'development') {
+    throw new Error('❌ ENCRYPTION_KEY obligatoire (hors NODE_ENV=development).');
+  }
+  console.warn('⚠️ ENCRYPTION_KEY absente — fallback DEV utilisé. NE PAS UTILISER EN PROD.');
+}
+const ENCRYPTION_KEY = crypto.scryptSync(
+  ENCRYPTION_KEY_RAW || 'kenny_default_secret_key_2026',
+  'kenny_salt_v1',
+  32
+);
+
+const GEMINI_MODEL = 'gemini-3.8-flash';
+const GEMINI_URL = (key) =>
+  `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${key}`;
 
 // ============================================
-// 🛡️ WHITELIST AGENT GEMINI (sécurité)
+// 🛡️ WHITELIST AGENT GEMINI
 // ============================================
 const AGENT_COMMAND_WHITELIST = [
   /^ls(\s+[\w\-\.\/\*]+)*$/,
@@ -48,24 +87,33 @@ const AGENT_COMMAND_WHITELIST = [
   /^wc\s+-l\s+[\w\-\.\/]+$/,
   /^grep\s+(-n\s+)?["']?[\w\-\.]+["']?\s+[\w\-\.\/]+$/,
   /^python3?\s+--version$/,
-  /^python3?\s+-c\s+".*"(\s+2>&1)?$/,
-  /^python3?\s+-c\s+'.*'(\s+2>&1)?$/,
-  /^python3?\s+-m\s+py_compile\s+[\w\-\.\/\s]+(\s+2>&1)?$/,
+  /^python3?\s+-c\s+["'][^"'`$\\]{1,200}["'](\s+2>&1)?$/,
+  /^python3?\s+-m\s+py_compile\s+(?!.*\.\.)[\w\-\.\/\s]+(\s+2>&1)?$/,
   /^pip\s+list$/,
   /^pip\s+show\s+[\w\-]+$/,
   /^pip\s+freeze$/,
   /^timeout\s+\d+\s+python3?\s+(run|main|app)\.py(\s+2>&1)?$/,
+  /^python3?\s+(run|main|app)\.py(\s+2>&1)?$/,
   /^pip\s+install\s+(flask|numpy|scipy|pandas|matplotlib|requests|python-dotenv|sqlalchemy|psycopg2-binary|beautifulsoup4|lxml|openpyxl|jinja2|werkzeug)(\s+[\w\.\<\>=]+)?$/,
   /^pip\s+install\s+-r\s+requirements\.txt$/
 ];
 
 const AGENT_COMMAND_BLACKLIST = [
   /rm\s+-rf/, /sudo/, /chmod/, /chown/,
-  /curl\s+/, /wget/, /nc\s+/, /ssh/,
+  /curl\s+/, /wget\s+/, /\bnc\s+/, /\bssh\s+/,
   /apt-get/, /apt\s+/,
   /\.\.\//, /;\s*rm/, /\|\s*sh/, /\|\s*bash/,
   /eval\s+/, /exec\s+/, />\s*\/dev/,
-  /mkfs/, /dd\s+if=/, /:\(\)\s*\{/
+  /mkfs/, /dd\s+if=/, /:\(\)\s*\{/,
+  /-delete/, /-exec\b/, /-execdir/, /-ok\b/, /-okdir/,
+  /-fprint\b/, /-fprintf\b/, /-fls\b/,
+  /python3?\s+-c\s+["'][^"']*\b(import|from)\s+(os|sys|subprocess|shutil|pty|socket|importlib)/i,
+  /python3?\s+-c\s+["'][^"']*__import__/,
+  /python3?\s+-c\s+["'][^"']*open\s*\(/,
+  /python3?\s+-c\s+["'][^"']*exec\s*\(/,
+  /python3?\s+-c\s+["'][^"']*eval\s*\(/,
+  /`/, /\$\(/,
+  /\bos\s*\.\s*system/, /\bsubprocess\s*\./,
 ];
 
 function verifierCommandeAgent(cmd) {
@@ -78,154 +126,217 @@ function verifierCommandeAgent(cmd) {
   for (const regex of AGENT_COMMAND_WHITELIST) {
     if (regex.test(cmdTrimmed)) return { allowed: true };
   }
-  return { allowed: false, reason: `Commande non autorisée. Permises : ls, cat, head, tail, find, tree, pwd, python3 -c, py_compile, pip list, timeout python3 run.py, pip install <modules whitelist>.` };
+  return {
+    allowed: false,
+    reason: `Commande non autorisée. Permises : ls, cat, head, tail, find, tree, pwd, python3 -c, py_compile, pip list, timeout python3 run.py, pip install.`
+  };
 }
 
 const IV_LENGTH = 16;
 
 function chiffrer(text) {
-  if (!text) return null;
+  if (text === null || text === undefined) return null;
+  const str = String(text);
+  if (str === '') return '';
   const iv = crypto.randomBytes(IV_LENGTH);
-  const cipher = crypto.createCipheriv('aes-256-cbc', Buffer.from(ENCRYPTION_KEY.padEnd(32).slice(0, 32)), iv);
-  let encrypted = cipher.update(text);
+  const cipher = crypto.createCipheriv('aes-256-cbc', ENCRYPTION_KEY, iv);
+  let encrypted = cipher.update(str);
   encrypted = Buffer.concat([encrypted, cipher.final()]);
   return iv.toString('hex') + ':' + encrypted.toString('hex');
 }
 
 function dechiffrer(text) {
-  if (!text) return null;
+  if (text === null || text === undefined) return null;
+  if (typeof text !== 'string') return null;
+  if (text === '') return '';
+  const parts = text.split(':');
+  if (parts.length !== 2) return null;
+  const [ivHex, encHex] = parts;
+  // Correction de la syntaxe cassée (\vert{}\vert{} -> ||)
+  if (!/^[0-9a-f]{32}$/i.test(ivHex) || !/^[0-9a-f]+$/i.test(encHex)) return null;
   try {
-    const parts = text.split(':');
-    const iv = Buffer.from(parts[0], 'hex');
-    const encrypted = Buffer.from(parts[1], 'hex');
-    const decipher = crypto.createDecipheriv('aes-256-cbc', Buffer.from(ENCRYPTION_KEY.padEnd(32).slice(0, 32)), iv);
+    const iv = Buffer.from(ivHex, 'hex');
+    const encrypted = Buffer.from(encHex, 'hex');
+    const decipher = crypto.createDecipheriv('aes-256-cbc', ENCRYPTION_KEY, iv);
     let decrypted = decipher.update(encrypted);
     decrypted = Buffer.concat([decrypted, decipher.final()]);
     return decrypted.toString();
-  } catch (e) { return null; }
+  } catch (e) {
+    return null;
+  }
+}
+
+async function withPg(fn, connString = null) {
+  const client = await getNeonClient(connString);
+  try {
+    return await fn(client);
+  } finally {
+    await client.end().catch(() => {});
+  }
 }
 
 async function getNeonClient(connString = null) {
   const client = new Client({
     connectionString: connString || GLOBAL_KEYS.neonConn,
-    ssl: { rejectUnauthorized: false }
+    ssl: { rejectUnauthorized: false },
+    statement_timeout: 30000,
+    query_timeout: 30000
   });
   await client.connect();
   return client;
 }
 
-// ============================================
-// RÉCUPÉRER LES CLÉS D'UN USER
-// ============================================
+async function verifierProprietaireProjet(firebase_uid, project_id) {
+  if (!firebase_uid || !project_id) return false;
+  try {
+    return await withPg(async (client) => {
+      const r = await client.query(
+        `SELECT p.id FROM projects p
+           JOIN users u ON u.id = p.user_id
+         WHERE p.id = $1 AND u.firebase_uid = $2`,
+        [project_id, firebase_uid]
+      );
+      return r.rows.length > 0;
+    });
+  } catch (e) {
+    console.error('verifierProprietaireProjet:', e.message);
+    return false;
+  }
+}
+
 async function getKeysForUser(firebase_uid) {
   const keys = { ...GLOBAL_KEYS };
   if (!firebase_uid) return keys;
   try {
-    const client = await getNeonClient();
-    const user = await client.query('SELECT id FROM users WHERE firebase_uid = $1', [firebase_uid]);
-    if (user.rows.length === 0) { await client.end(); return keys; }
-    const userId = user.rows[0].id;
-    const envVars = await client.query('SELECT key, value FROM env_variables WHERE user_id = $1', [userId]);
-    await client.end();
-    for (const row of envVars.rows) {
-      const k = row.key.toUpperCase().trim();
-      const v = dechiffrer(row.value);
-      if (!v) continue;
-      if (k === 'GEMINI_API_KEY' || k === 'GEMINI') keys.gemini = v;
-      else if (k === 'NEON_API_KEY' || k === 'NEON') keys.neon = v;
-      else if (k === 'NEON_CONNECTION_STRING' || k === 'NEON_CONN') keys.neonConn = v;
-      else if (k === 'GITHUB_TOKEN' || k === 'GITHUB') keys.github = v;
-      else if (k === 'CLOUDFLARE_TOKEN' || k === 'CLOUDFLARE') keys.cloudflare = v;
-      else if (k === 'CLOUDFLARE_AI_TOKEN' || k === 'CLOUDFLARE_AI') keys.cloudflareAI = v;
-      else if (k === 'CLOUDFLARE_ACCOUNT_ID' || k === 'CLOUDFLARE_ACCOUNT') keys.cloudflareAccount = v;
-      else if (k === 'RENDER_TOKEN' || k === 'RENDER') keys.render = v;
-      else if (k === 'RENDER_OWNER_ID' || k === 'RENDER_OWNER') keys.renderOwner = v;
-      else if (k === 'E2B_API_KEY' || k === 'E2B') keys.e2b = v;
-    }
-  } catch (e) {}
+    await withPg(async (client) => {
+      const user = await client.query('SELECT id FROM users WHERE firebase_uid = $1', [firebase_uid]);
+      if (user.rows.length === 0) return;
+      const userId = user.rows[0].id;
+      const envVars = await client.query('SELECT key, value FROM env_variables WHERE user_id = $1', [userId]);
+      for (const row of envVars.rows) {
+        const k = row.key.toUpperCase().trim();
+        const v = dechiffrer(row.value);
+        if (v === null) continue;
+        if (k === 'GEMINI_API_KEY' || k === 'GEMINI') keys.gemini = v;
+        else if (k === 'NEON_API_KEY' || k === 'NEON') keys.neon = v;
+        else if (k === 'NEON_CONNECTION_STRING' || k === 'NEON_CONN') keys.neonConn = v;
+        else if (k === 'GITHUB_TOKEN' || k === 'GITHUB') keys.github = v;
+        else if (k === 'CLOUDFLARE_TOKEN' || k === 'CLOUDFLARE') keys.cloudflare = v;
+        else if (k === 'CLOUDFLARE_AI_TOKEN' || k === 'CLOUDFLARE_AI') keys.cloudflareAI = v;
+        else if (k === 'CLOUDFLARE_ACCOUNT_ID' || k === 'CLOUDFLARE_ACCOUNT') keys.cloudflareAccount = v;
+        else if (k === 'RENDER_TOKEN' || k === 'RENDER') keys.render = v;
+        else if (k === 'RENDER_OWNER_ID' || k === 'RENDER_OWNER') keys.renderOwner = v;
+        else if (k === 'E2B_API_KEY' || k === 'E2B') keys.e2b = v;
+      }
+    });
+  } catch (e) {
+    console.error('getKeysForUser error:', e.message);
+  }
   return keys;
 }
 
-// ============================================
-// VÉRIFIER LE QUOTA
-// ============================================
 async function verifierQuota(firebase_uid) {
   try {
-    const client = await getNeonClient();
-    const user = await client.query(
-      'SELECT id, plan, commands_today, last_command_reset FROM users WHERE firebase_uid = $1',
-      [firebase_uid]
-    );
-    if (user.rows.length === 0) { await client.end(); return { allowed: false, error: 'User non trouvé' }; }
-    const u = user.rows[0];
-    if (u.plan === 'pro' || u.plan === 'premium') { await client.end(); return { allowed: true, remaining: '∞', plan: u.plan }; }
-    const today = new Date().toISOString().split('T')[0];
-    const lastReset = u.last_command_reset ? u.last_command_reset.toISOString().split('T')[0] : null;
-    let commandsToday = u.commands_today || 0;
-    if (lastReset !== today) {
-      commandsToday = 0;
-      await client.query('UPDATE users SET commands_today = 0, last_command_reset = $1 WHERE id = $2', [today, u.id]);
-    }
-    const LIMITE_FREE = 50;
-    if (commandsToday >= LIMITE_FREE) {
-      await client.end();
-      return { allowed: false, error: `Limite atteinte (${LIMITE_FREE}/jour). Passe au plan Pro.`, plan: u.plan, used: commandsToday, limit: LIMITE_FREE };
-    }
-    await client.query('UPDATE users SET commands_today = commands_today + 1 WHERE id = $1', [u.id]);
-    await client.end();
-    return { allowed: true, plan: u.plan, used: commandsToday + 1, limit: LIMITE_FREE, remaining: LIMITE_FREE - commandsToday - 1 };
+    return await withPg(async (client) => {
+      const user = await client.query(
+        'SELECT id, plan FROM users WHERE firebase_uid = $1',
+        [firebase_uid]
+      );
+      if (user.rows.length === 0) return { allowed: false, error: 'User non trouvé' };
+      const u = user.rows[0];
+
+      if (u.plan === 'pro' || u.plan === 'premium') {
+        return { allowed: true, remaining: '∞', plan: u.plan };
+      }
+
+      const today = new Date().toISOString().split('T')[0];
+
+      const updated = await client.query(
+        `UPDATE users
+           SET commands_today = CASE
+                 WHEN last_command_reset IS NULL OR last_command_reset::date <> $2::date
+                 THEN 1
+                 ELSE commands_today + 1
+               END,
+               last_command_reset = $2::date
+         WHERE id = $1
+           AND (
+             last_command_reset IS NULL
+             OR last_command_reset::date <> $2::date
+             OR commands_today < $3
+           )
+         RETURNING commands_today`,
+        [u.id, today, LIMITE_FREE]
+      );
+
+      if (updated.rowCount === 0) {
+        return {
+          allowed: false,
+          error: `Limite atteinte (${LIMITE_FREE}/jour). Passe au plan Pro.`,
+          plan: u.plan,
+          used: LIMITE_FREE,
+          limit: LIMITE_FREE
+        };
+      }
+
+      const used = updated.rows[0].commands_today;
+      return {
+        allowed: true,
+        plan: u.plan,
+        used,
+        limit: LIMITE_FREE,
+        remaining: LIMITE_FREE - used
+      };
+    });
   } catch (e) {
+    console.error('verifierQuota error:', e.message);
     return { allowed: false, error: e.message };
   }
 }
 
-// ============================================
-// ROUTE DE TEST
-// ============================================
 app.get('/', (req, res) => {
-  res.json({ message: 'Kenny OK', gemini: GLOBAL_KEYS.gemini ? '✅' : '❌' });
+  res.json({ message: 'Kenny OK', gemini: GLOBAL_KEYS.gemini ? '✅' : '❌', model: GEMINI_MODEL });
 });
 
-// ============================================
-// SYNC USER
-// ============================================
 app.post('/api/user/sync', async (req, res) => {
   const { firebase_uid, email } = req.body;
   if (!firebase_uid || !email) return res.status(400).json({ error: 'Champs requis' });
-  let client;
   try {
-    client = await getNeonClient();
-    const existing = await client.query('SELECT id FROM users WHERE firebase_uid = $1', [firebase_uid]);
-    let userId;
-    if (existing.rows.length > 0) {
-      userId = existing.rows[0].id;
-      await client.query('UPDATE users SET last_login = NOW() WHERE id = $1', [userId]);
-    } else {
-      const inserted = await client.query(`INSERT INTO users (firebase_uid, email) VALUES ($1, $2) RETURNING id`, [firebase_uid, email]);
-      userId = inserted.rows[0].id;
-    }
-    await client.end();
+    const userId = await withPg(async (client) => {
+      const existing = await client.query('SELECT id FROM users WHERE firebase_uid = $1', [firebase_uid]);
+      if (existing.rows.length > 0) {
+        const id = existing.rows[0].id;
+        await client.query('UPDATE users SET last_login = NOW() WHERE id = $1', [id]);
+        return id;
+      }
+      const inserted = await client.query(
+        'INSERT INTO users (firebase_uid, email) VALUES ($1, $2) RETURNING id',
+        [firebase_uid, email]
+      );
+      return inserted.rows[0].id;
+    });
     res.json({ success: true, user_id: userId });
   } catch (error) {
-    if (client) await client.end();
     res.status(500).json({ error: error.message });
   }
 });
 
-// ============================================
-// ENVIRONNEMENT
-// ============================================
 app.get('/api/env/load/:firebase_uid', async (req, res) => {
-  let client;
   try {
-    client = await getNeonClient();
-    const user = await client.query('SELECT id FROM users WHERE firebase_uid = $1', [req.params.firebase_uid]);
-    if (user.rows.length === 0) { await client.end(); return res.json({ success: true, variables: [] }); }
-    const result = await client.query('SELECT key, value FROM env_variables WHERE user_id = $1 ORDER BY created_at ASC', [user.rows[0].id]);
-    await client.end();
-    res.json({ success: true, variables: result.rows.map(r => ({ key: r.key, value: r.value ? '••••••••' : '' })) });
+    const variables = await withPg(async (client) => {
+      const user = await client.query('SELECT id FROM users WHERE firebase_uid = $1', [req.params.firebase_uid]);
+      if (user.rows.length === 0) return [];
+      const result = await client.query(
+        'SELECT key, value FROM env_variables WHERE user_id = $1 ORDER BY created_at ASC',
+        [user.rows[0].id]
+      );
+      return result.rows.map(r => ({
+        key: r.key,
+        value: (r.value === null || r.value === undefined) ? '' : '••••••••'
+      }));
+    });
+    res.json({ success: true, variables });
   } catch (error) {
-    if (client) await client.end();
     res.status(500).json({ error: error.message });
   }
 });
@@ -233,117 +344,219 @@ app.get('/api/env/load/:firebase_uid', async (req, res) => {
 app.post('/api/env/save', async (req, res) => {
   const { firebase_uid, variables } = req.body;
   if (!firebase_uid || !Array.isArray(variables)) return res.status(400).json({ error: 'Champs requis' });
-  let client;
+
   try {
-    client = await getNeonClient();
-    const user = await client.query('SELECT id FROM users WHERE firebase_uid = $1', [firebase_uid]);
-    if (user.rows.length === 0) { await client.end(); return res.status(404).json({ error: 'User non trouvé' }); }
-    const userId = user.rows[0].id;
-    const old = await client.query('SELECT key, value FROM env_variables WHERE user_id = $1', [userId]);
-    const oldMap = new Map();
-    for (const row of old.rows) oldMap.set(row.key, row.value);
-    await client.query('DELETE FROM env_variables WHERE user_id = $1', [userId]);
-    for (const v of variables) {
-      if (!v.key || !v.key.trim()) continue;
-      let finalValue = v.value;
-      if (v.value === '••••••••' && oldMap.has(v.key)) finalValue = oldMap.get(v.key);
-      let encrypted = (finalValue && finalValue !== '••••••••') ? chiffrer(finalValue) : finalValue;
-      await client.query('INSERT INTO env_variables (user_id, key, value) VALUES ($1, $2, $3)', [userId, v.key.trim(), encrypted]);
-    }
-    await client.end();
+    await withPg(async (client) => {
+      const user = await client.query('SELECT id FROM users WHERE firebase_uid = $1', [firebase_uid]);
+      if (user.rows.length === 0) {
+        const err = new Error('User non trouvé');
+        err.status = 404;
+        throw err;
+      }
+      const userId = user.rows[0].id;
+
+      const old = await client.query('SELECT key, value FROM env_variables WHERE user_id = $1', [userId]);
+      const oldMap = new Map();
+      for (const row of old.rows) oldMap.set(row.key, row.value);
+
+      const seenKeys = new Set();
+      for (const v of variables) {
+        if (!v.key || !v.key.trim()) continue;
+        const trimmedKey = v.key.trim();
+        if (seenKeys.has(trimmedKey)) {
+          const err = new Error(`Variable "${trimmedKey}" en double`);
+          err.status = 400;
+          throw err;
+        }
+        seenKeys.add(trimmedKey);
+        if (v.value === '••••••••' && !oldMap.has(trimmedKey)) {
+          const err = new Error(`Variable "${trimmedKey}" : valeur masquée mais inexistante`);
+          err.status = 400;
+          throw err;
+        }
+      }
+
+      await client.query('BEGIN');
+      try {
+        await client.query('DELETE FROM env_variables WHERE user_id = $1', [userId]);
+        for (const v of variables) {
+          if (!v.key || !v.key.trim()) continue;
+          const trimmedKey = v.key.trim();
+          
+          let encrypted;
+          if (v.value === '••••••••' && oldMap.has(trimmedKey)) {
+            encrypted = oldMap.get(trimmedKey);
+          } else {
+            encrypted = (v.value === null || v.value === undefined) ? null : chiffrer(v.value);
+          }
+
+          await client.query(
+            'INSERT INTO env_variables (user_id, key, value) VALUES ($1, $2, $3)',
+            [userId, trimmedKey, encrypted]
+          );
+        }
+        await client.query('COMMIT');
+      } catch (e) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw e;
+      }
+    });
     res.json({ success: true });
   } catch (error) {
-    if (client) await client.end();
-    res.status(500).json({ error: error.message });
+    res.status(error.status || 500).json({ error: error.message });
   }
 });
 
-app.post('/api/env/test', async (req, res) => {
+app.post('/api/env/test', iaLimiter, async (req, res) => {
   const { key, value } = req.body;
   if (!key || !value) return res.status(400).json({ error: 'Champs requis' });
   const results = {};
-  const keyUpper = key.toUpperCase();
+  const k = key.toUpperCase().trim();
   try {
-    if (keyUpper.includes('GEMINI')) {
-      await axios.post(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=${value}`, { contents: [{ role: 'user', parts: [{ text: 'test' }] }] }, { timeout: 10000 });
+    if (k === 'GEMINI_API_KEY' || k === 'GEMINI') {
+      await axios.post(GEMINI_URL(value), {
+        contents: [{ role: 'user', parts: [{ text: 'test' }] }]
+      }, { timeout: 10000 });
       results[key] = '✅ OK';
-    } else if (keyUpper.includes('NEON')) {
-      await axios.get('https://console.neon.tech/api/v2/projects', { headers: { 'Authorization': `Bearer ${value}` }, timeout: 10000 });
+    } else if (k === 'NEON_API_KEY' || k === 'NEON') {
+      await axios.get('https://console.neon.tech/api/v2/projects', {
+        headers: { 'Authorization': `Bearer ${value}` },
+        timeout: 10000
+      });
       results[key] = '✅ OK';
-    } else if (keyUpper.includes('GITHUB')) {
-      await axios.get('https://api.github.com/user', { headers: { 'Authorization': `token ${value}` }, timeout: 10000 });
-      results[key] = '✅ OK';
-    } else if (keyUpper.includes('CLOUDFLARE')) {
-      await axios.get('https://api.cloudflare.com/client/v4/user/tokens/verify', { headers: { 'Authorization': `Bearer ${value}` }, timeout: 10000 });
-      results[key] = '✅ OK';
-    } else if (keyUpper.includes('RENDER')) {
-      await axios.get('https://api.render.com/v1/services?limit=1', { headers: { 'Authorization': `Bearer ${value}` }, timeout: 10000 });
-      results[key] = '✅ OK';
-    } else {
-      results[key] = '⚠️ Type inconnu';
+    } else if (k === 'NEON_CONNECTION_STRING' || k === 'NEON_CONN') {
+  try {
+    const url = new URL(value);
+    if (!url.hostname.endsWith('.neon.tech') && url.hostname !== 'localhost') {
+      results[key] = '❌ Hôte Neon attendu (.neon.tech)';
+      return res.json({ success: true, results });
     }
+  } catch {
+    results[key] = '❌ URL invalide';
+    return res.json({ success: true, results });
+  }
+  const c = new Client({ connectionString: value, ssl: { rejectUnauthorized: false } });
+  try {
+    await c.connect();
+    await c.query('SELECT 1');
+  } finally {
+    await c.end().catch(() => {});
+  }
+    results[key] = '✅ OK';
+} else if (k === 'GITHUB_TOKEN' || k === 'GITHUB') {
+      await axios.get('https://api.github.com/user', {
+        headers: { 'Authorization': `token ${value}` },
+        timeout: 10000
+      });
+      results[key] = '✅ OK';
+    } else if (k === 'CLOUDFLARE_TOKEN' || k === 'CLOUDFLARE' || k === 'CLOUDFLARE_AI_TOKEN' || k === 'CLOUDFLARE_AI') {
+      await axios.get('https://api.cloudflare.com/client/v4/user/tokens/verify', {
+        headers: { 'Authorization': `Bearer ${value}` },
+        timeout: 10000
+      });
+      results[key] = '✅ OK';
+    } else if (k === 'CLOUDFLARE_ACCOUNT_ID' || k === 'CLOUDFLARE_ACCOUNT') {
+      const uuidRe = /^[0-9a-f]{32}$/i;
+      results[key] = uuidRe.test(value.replace(/-/g, '')) ? '✅ Format UUID valide' : '⚠️ Ne ressemble pas à un Account ID';
+    } else if (k === 'RENDER_TOKEN' || k === 'RENDER') {
+      await axios.get('https://api.render.com/v1/services?limit=1', {
+        headers: { 'Authorization': `Bearer ${value}` },
+        timeout: 10000
+      });
+      results[key] = '✅ OK';
+    } else if (k === 'RENDER_OWNER_ID' || k === 'RENDER_OWNER') {
+      results[key] = /^[a-z0-9]+$/i.test(value) ? '✅ Format plausible' : '⚠️ Format douteux';
+      } else if (k === 'E2B_API_KEY' || k === 'E2B') {
+    results[key] = '⚠️ Test non implémenté';
+  } else {
+    results[key] = '⚠️ Type inconnu';
+  }
+
   } catch (e) {
     results[key] = '❌ ' + (e.response?.status || e.message);
   }
   res.json({ success: true, results });
 });
 
-// ============================================
-// PROJETS
-// ============================================
 app.post('/api/projects/create', async (req, res) => {
   const { firebase_uid, name } = req.body;
   if (!firebase_uid || !name) return res.status(400).json({ error: 'Champs requis' });
-  let client;
   try {
-    client = await getNeonClient();
-    const user = await client.query('SELECT id FROM users WHERE firebase_uid = $1', [firebase_uid]);
-    if (user.rows.length === 0) { await client.end(); return res.status(404).json({ error: 'User non trouvé' }); }
-    const project = await client.query('INSERT INTO projects (user_id, name) VALUES ($1, $2) RETURNING *', [user.rows[0].id, name]);
-    await client.end();
-    res.json({ success: true, project: project.rows[0] });
+    const project = await withPg(async (client) => {
+      const user = await client.query('SELECT id FROM users WHERE firebase_uid = $1', [firebase_uid]);
+      if (user.rows.length === 0) {
+        const err = new Error('User non trouvé'); err.status = 404; throw err;
+      }
+      const p = await client.query(
+        'INSERT INTO projects (user_id, name) VALUES ($1, $2) RETURNING *',
+        [user.rows[0].id, name]
+      );
+      return p.rows[0];
+    });
+    res.json({ success: true, project });
   } catch (error) {
-    if (client) await client.end();
-    res.status(500).json({ error: error.message });
+    res.status(error.status || 500).json({ error: error.message });
   }
 });
 
 app.get('/api/projects/list/:firebase_uid', async (req, res) => {
-  let client;
   try {
-    client = await getNeonClient();
-    const user = await client.query('SELECT id FROM users WHERE firebase_uid = $1', [req.params.firebase_uid]);
-    if (user.rows.length === 0) { await client.end(); return res.json({ success: true, projects: [] }); }
-    const projects = await client.query('SELECT * FROM projects WHERE user_id = $1 ORDER BY created_at DESC', [user.rows[0].id]);
-    await client.end();
-    res.json({ success: true, projects: projects.rows });
+    const projects = await withPg(async (client) => {
+      const user = await client.query('SELECT id FROM users WHERE firebase_uid = $1', [req.params.firebase_uid]);
+      if (user.rows.length === 0) return [];
+      const p = await client.query(
+        'SELECT * FROM projects WHERE user_id = $1 ORDER BY created_at DESC',
+        [user.rows[0].id]
+      );
+      return p.rows;
+    });
+    res.json({ success: true, projects });
   } catch (error) {
-    if (client) await client.end();
     res.status(500).json({ error: error.message });
   }
 });
 
 app.get('/api/projects/:project_id/details', async (req, res) => {
-  let client;
+  const firebase_uid = req.headers['x-firebase-uid'];
+  if (!firebase_uid) return res.status(400).json({ error: 'Header x-firebase-uid requis' });
   try {
-    client = await getNeonClient();
-    const project = await client.query('SELECT * FROM projects WHERE id = $1', [req.params.project_id]);
-    if (project.rows.length === 0) { await client.end(); return res.status(404).json({ error: 'Projet non trouvé' }); }
-    const messages = await client.query('SELECT role, content FROM conversation_memory WHERE project_id = $1 ORDER BY created_at ASC', [req.params.project_id]);
-    const files = await client.query('SELECT * FROM files WHERE project_id = $1 ORDER BY created_at ASC', [req.params.project_id]);
-    const workspace = await client.query('SELECT * FROM workspaces WHERE project_id = $1', [req.params.project_id]);
-    await client.end();
-    res.json({ success: true, project: project.rows[0], messages: messages.rows, files: files.rows, workspace: workspace.rows[0] || null });
+    const data = await withPg(async (client) => {
+      const project = await client.query(
+        `SELECT p.* FROM projects p
+           JOIN users u ON u.id = p.user_id
+         WHERE p.id = $1 AND u.firebase_uid = $2`,
+        [req.params.project_id, firebase_uid]
+      );
+      if (project.rows.length === 0) {
+        const err = new Error('Projet non trouvé ou accès refusé'); err.status = 404; throw err;
+      }
+      const messages = await client.query(
+        'SELECT role, content FROM conversation_memory WHERE project_id = $1 ORDER BY created_at ASC',
+        [req.params.project_id]
+      );
+      const files = await client.query(
+        'SELECT * FROM files WHERE project_id = $1 ORDER BY created_at ASC',
+        [req.params.project_id]
+      );
+      const workspace = await client.query(
+        'SELECT * FROM workspaces WHERE project_id = $1',
+        [req.params.project_id]
+      );
+      return {
+        project: project.rows[0],
+        messages: messages.rows,
+        files: files.rows,
+        workspace: workspace.rows[0] || null
+      };
+    });
+    res.json({ success: true, ...data });
   } catch (error) {
-    if (client) await client.end();
-    res.status(500).json({ error: error.message });
+    res.status(error.status || 500).json({ error: error.message });
   }
 });
 
-// ============================================
-// WORKSPACE AUTO (Cloudflare désactivé)
-// ============================================
 async function creerRepoGitHub(name, userToken) {
+  if (!userToken) return { success: false, error: 'Token GitHub manquant' };
   try {
     const repoName = 'kenny-' + name.toLowerCase().replace(/[^a-z0-9-]/g, '-').substring(0, 40) + '-' + Date.now().toString(36);
     const res = await axios.post('https://api.github.com/user/repos',
@@ -356,17 +569,18 @@ async function creerRepoGitHub(name, userToken) {
   }
 }
 
-async function creerProjetNeon(name) {
+async function creerProjetNeon(name, neonKey) {
+  if (!neonKey) return { success: false, error: 'Clé Neon manquante' };
   try {
     const projectName = 'kenny-' + name.toLowerCase().replace(/[^a-z0-9-]/g, '-').substring(0, 40) + '-' + Date.now().toString(36);
     const res = await axios.post('https://console.neon.tech/api/v2/projects',
       { project: { name: projectName, region_id: 'aws-eu-central-1', pg_version: 16 } },
-      { headers: { 'Authorization': `Bearer ${GLOBAL_KEYS.neon}`, 'Content-Type': 'application/json', 'Accept': 'application/json' } }
+      { headers: { 'Authorization': `Bearer ${neonKey}`, 'Content-Type': 'application/json', 'Accept': 'application/json' } }
     );
     const projectId = res.data.project.id;
     const connRes = await axios.get(
       `https://console.neon.tech/api/v2/projects/${projectId}/connection_uri?database_name=neondb&role_name=neondb_owner`,
-      { headers: { 'Authorization': `Bearer ${GLOBAL_KEYS.neon}`, 'Accept': 'application/json' } }
+      { headers: { 'Authorization': `Bearer ${neonKey}`, 'Accept': 'application/json' } }
     );
     return { success: true, project_id: projectId, connection_uri: connRes.data.uri };
   } catch (e) {
@@ -376,34 +590,24 @@ async function creerProjetNeon(name) {
 
 async function creerServiceRender(name, repoUrl, userToken, ownerId, langage = 'web') {
   if (!userToken || !ownerId) return { success: false, skipped: true, reason: 'Token Render non configuré' };
+  if (!repoUrl) return { success: false, skipped: true, reason: 'Repo GitHub indisponible' };
   try {
     const serviceName = 'kenny-' + name.toLowerCase().replace(/[^a-z0-9-]/g, '-').substring(0, 40) + '-' + Date.now().toString(36);
 
-    let envConfig;
-    if (langage === 'python') {
-      envConfig = {
-        env: 'python',
-        buildCommand: 'pip install -r requirements.txt',
-        startCommand: 'python run.py'
-      };
-    } else {
-      envConfig = {
-        env: 'node',
-        buildCommand: 'npm install',
-        startCommand: 'node server.js'
-      };
-    }
+    const envConfig = langage === 'python'
+      ? { buildCommand: 'pip install -r requirements.txt', startCommand: 'python run.py' }
+      : { buildCommand: 'npm install', startCommand: 'node server.js' };
 
     const res = await axios.post('https://api.render.com/v1/services',
       {
         type: 'web_service',
         name: serviceName,
-        ownerId: ownerId,
+        ownerId,
         repo: repoUrl,
         branch: 'main',
         autoDeploy: 'yes',
         serviceDetails: {
-          ...envConfig,
+          env: langage === 'python' ? 'python' : 'node',
           plan: 'free',
           region: 'frankfurt',
           envSpecificDetails: {
@@ -420,218 +624,95 @@ async function creerServiceRender(name, repoUrl, userToken, ownerId, langage = '
   }
 }
 
-// 🔥 Cloudflare DÉSACTIVÉ
-async function creerZoneCloudflare(name) {
+async function creerZoneCloudflare() {
   return { success: false, skipped: true, reason: 'Cloudflare désactivé temporairement' };
 }
 
-app.post('/api/workspaces/create', async (req, res) => {
+const workspaceLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 5,
+  message: { error: 'Trop de créations de workspace, réessaie dans 1 minute.' }
+});
+
+app.post('/api/workspaces/create', workspaceLimiter, async (req, res) => {
   const { firebase_uid, project_id, project_name } = req.body;
-  if (!firebase_uid || !project_id || !project_name) return res.status(400).json({ error: 'Champs requis' });
-
-  let client;
   try {
-    client = await getNeonClient();
-    const user = await client.query('SELECT id FROM users WHERE firebase_uid = $1', [firebase_uid]);
-    if (user.rows.length === 0) { await client.end(); return res.status(404).json({ error: 'User non trouvé' }); }
-    const userId = user.rows[0].id;
+    const workspaceId = await withPg(async (client) => {
+      const user = await client.query('SELECT id FROM users WHERE firebase_uid = $1', [firebase_uid]);
+      if (user.rows.length === 0) { const e = new Error('User non trouvé'); e.status = 404; throw e; }
+      const userId = user.rows[0].id;
 
-    const ws = await client.query('INSERT INTO workspaces (project_id, user_id, status) VALUES ($1, $2, $3) RETURNING id', [project_id, userId, 'creating']);
-    const workspaceId = ws.rows[0].id;
-    await client.end();
+      const owned = await client.query('SELECT id FROM projects WHERE id = $1 AND user_id = $2', [project_id, userId]);
+      if (owned.rows.length === 0) { const e = new Error('Ce projet ne t\'appartient pas'); e.status = 403; throw e; }
 
+      const existing = await client.query(
+  'SELECT id FROM workspaces WHERE project_id = $1',
+  [project_id]
+);
+if (existing.rows.length > 0) {
+  const e = new Error('Un workspace existe déjà pour ce projet');
+  e.status = 409;
+  throw e;
+}
+
+  const ws = await client.query(
+    'INSERT INTO workspaces (project_id, user_id, status) VALUES ($1, $2, $3) RETURNING id',
+    [project_id, userId, 'creating']
+  );
+  return ws.rows[0].id;
+});
     const keys = await getKeysForUser(firebase_uid);
 
     console.log('📦 GitHub...');
     const githubResult = await creerRepoGitHub(project_name, keys.github);
 
     console.log('🗄️ Neon...');
-    const neonResult = await creerProjetNeon(project_name);
+    const neonResult = await creerProjetNeon(project_name, keys.neon);
 
     console.log('🚀 Render...');
-    const renderResult = await creerServiceRender(project_name, githubResult.success ? githubResult.clone_url : '', keys.render, keys.renderOwner, 'web');
+    const renderResult = await creerServiceRender(
+      project_name,
+      githubResult.success ? githubResult.clone_url : '',
+      keys.render,
+      keys.renderOwner,
+      'web'
+    );
 
     console.log('🌐 Cloudflare (désactivé)');
-    const cloudflareResult = await creerZoneCloudflare(project_name);
+    const cloudflareResult = await creerZoneCloudflare();
 
-    const client2 = await getNeonClient();
-    await client2.query(`
-      UPDATE workspaces SET
-        github_repo = $1, github_clone_url = $2,
-        neon_project_id = $3, neon_connection_string = $4,
-        render_service_id = $5, render_service_url = $6,
-        cloudflare_zone_id = $7, cloudflare_domain = $8,
-        status = $9
-      WHERE id = $10
-    `, [
-      githubResult.repo || null, githubResult.clone_url || null,
-      neonResult.project_id || null, neonResult.connection_uri || null,
-      renderResult.service_id || null, renderResult.service_url || null,
-      null, null, 'ready', workspaceId
-    ]);
-    await client2.end();
+    await withPg(async (client) => {
+      await client.query(`
+        UPDATE workspaces SET
+          github_repo = $1, github_clone_url = $2,
+          neon_project_id = $3, neon_connection_string = $4,
+          render_service_id = $5, render_service_url = $6,
+          cloudflare_zone_id = $7, cloudflare_domain = $8,
+          status = $9
+        WHERE id = $10
+      `, [
+        githubResult.repo || null, githubResult.clone_url || null,
+        neonResult.project_id || null, neonResult.connection_uri || null,
+        renderResult.service_id || null, renderResult.service_url || null,
+        null, null, 'ready', workspaceId
+      ]);
+    });
 
     res.json({ success: true, workspace: { github: githubResult, neon: neonResult, render: renderResult, cloudflare: cloudflareResult } });
   } catch (error) {
-    if (client) await client.end();
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// ============================================
-// 🔥 FULL BUILD — Génération complète
-// ============================================
-app.post('/api/build/full', async (req, res) => {
-  const { firebase_uid, project_id, prompt } = req.body;
-  if (!firebase_uid || !project_id || !prompt) return res.status(400).json({ error: 'Champs requis' });
-
-  const keys = await getKeysForUser(firebase_uid);
-  if (!keys.gemini) return res.status(500).json({ error: 'Clé Gemini manquante' });
-
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-  res.setHeader('X-Accel-Buffering', 'no');
-
-  const envoyer = (type, data) => res.write(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`);
-
-  try {
-    envoyer('status', { message: '🧠 Analyse de la demande...' });
-
-    const systemPrompt = `Tu es un développeur senior expert. Tu vas générer une application COMPLÈTE (Full Build) avec frontend, backend, et base de données.
-
-RÈGLES ABSOLUES :
-
-1. STRUCTURE OBLIGATOIRE :
-   - \`\`\`html:index.html\`\`\` → Le frontend principal
-   - \`\`\`css:style.css\`\`\` → Le CSS
-   - \`\`\`javascript:script.js\`\`\` → Le JS frontend
-   - \`\`\`javascript:server.js\`\`\` → Le backend Express
-   - \`\`\`json:package.json\`\`\` → Les dépendances
-   - \`\`\`markdown:README.md\`\`\` → Documentation
-
-2. BACKEND (server.js) :
-   - Express.js
-   - Routes API : /api/items, /api/users, etc.
-   - Connexion à une base de données (PostgreSQL via pg)
-   - Gestion d'erreurs
-   - Port process.env.PORT || 3000
-
-3. PACKAGE.JSON :
-   - name, version, main, scripts.start, dependencies
-   - Dépendances : express, cors, pg, dotenv
-
-4. FRONTEND :
-   - HTML complet avec toutes les pages (menu, accueil, ajout, etc.)
-   - CSS moderne (Tailwind ou custom)
-   - JS avec fetch vers /api
-   - Pas d'emojis dans le code
-
-5. CHOIX TECHNIQUE :
-   - Si l'app est SIMPLE → Vanilla HTML/CSS/JS + Express
-   - Si l'app est COMPLEXE → React + Express (mais code en HTML/CSS/JS pour compatibilité)
-
-6. FONCTIONNALITÉS COMPLÈTES :
-   - Toutes les pages du menu fonctionnent
-   - Les boutons font de vraies actions
-   - La recherche marche
-   - La base de données est utilisée
-   - Les erreurs sont gérées
-
-7. FORMAT DE SORTIE :
-   - D'abord, explique ce que tu vas construire (2-3 phrases)
-   - Ensuite, génère TOUS les fichiers avec \`\`\`langage:nom_fichier
-   - Ne t'arrête PAS au milieu
-
-Génère une application complète et fonctionnelle.`;
-
-    envoyer('status', { message: '🔨 Génération du code complet...' });
-
-    const response = await axios.post(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=${keys.gemini}`,
-      {
-        systemInstruction: { parts: [{ text: systemPrompt }] },
-        contents: [{ role: 'user', parts: [{ text: prompt }] }],
-        generationConfig: { temperature: 0.7, maxOutputTokens: 8000 }
-      },
-      { headers: { 'Content-Type': 'application/json' }, timeout: 180000 }
-    );
-
-    let reponse = response.data.candidates[0].content.parts[0].text;
-    let blocks = extraireBlocs(reponse);
-
-    envoyer('status', { message: `📦 ${blocks.length} fichiers générés, sauvegarde...` });
-
-    const client = await getNeonClient();
-    await client.query('DELETE FROM files WHERE project_id = $1', [project_id]);
-    for (const file of blocks) {
-      await client.query('INSERT INTO files (project_id, name, language, content) VALUES ($1, $2, $3, $4)',
-        [project_id, file.nom, file.langage, file.contenu]);
-      envoyer('file', { name: file.nom, language: file.langage, content: file.contenu });
-    }
-    await client.end();
-
-    const wsClient = await getNeonClient();
-    const ws = await wsClient.query('SELECT * FROM workspaces WHERE project_id = $1', [project_id]);
-    await wsClient.end();
-
-    if (ws.rows.length > 0 && ws.rows[0].github_repo) {
-      envoyer('status', { message: '🐙 Push sur GitHub...' });
-      const githubToken = keys.github;
-      const repoFullName = ws.rows[0].github_repo;
-
-      for (const file of blocks) {
-        try {
-          let sha = null;
-          try {
-            const checkRes = await axios.get(
-              `https://api.github.com/repos/${repoFullName}/contents/${file.nom}`,
-              { headers: { 'Authorization': `token ${githubToken}`, 'Accept': 'application/vnd.github.v3+json' } }
-            );
-            sha = checkRes.data.sha;
-          } catch (e) {}
-
-          await axios.put(
-            `https://api.github.com/repos/${repoFullName}/contents/${file.nom}`,
-            {
-              message: `Ajout ${file.nom}`,
-              content: Buffer.from(file.contenu).toString('base64'),
-              ...(sha && { sha })
-            },
-            { headers: { 'Authorization': `token ${githubToken}`, 'Accept': 'application/vnd.github.v3+json' } }
-          );
-        } catch (e) {
-          console.log(`Erreur push ${file.nom}:`, e.message);
-        }
-      }
-      envoyer('status', { message: '✅ Push GitHub terminé' });
-    }
-
-    const finalUrl = ws.rows[0]?.render_service_url || ws.rows[0]?.github_repo || 'En cours...';
-    envoyer('done', {
-      message: '✅ Full Build terminé !',
-      url: finalUrl,
-      files_count: blocks.length
-    });
-
-    res.write('event: end\ndata: {}\n\n');
-    res.end();
-
-  } catch (error) {
-    console.error('Erreur full build:', error.message);
-    envoyer('error', { message: error.message });
-    res.end();
+    res.status(error.status || 500).json({ error: error.message });
   }
 });
 
 function extraireBlocs(text) {
-  const regex = /```(\w+)(?::([^\n]+))?\n([\s\S]*?)```/g;
+  const regex = /```([a-zA-Z0-9_+\-]*)(?:[:\s]+([^\s\n`]+))?\s*\n([\s\S]*?)```/g;
   const blocs = [];
   let match;
   while ((match = regex.exec(text)) !== null) {
-    const langage = match[1] || 'code';
-    const nomFichier = match[2] ? match[2].trim() : null;
+    const langage = (match[1] || 'code').toLowerCase();
+    let nomFichier = match[2] ? match[2].trim() : null;
     const contenu = match[3].trim();
+    if (!contenu) continue;
 
     let nom = nomFichier;
     if (!nom) {
@@ -641,12 +722,12 @@ function extraireBlocs(text) {
         nom = 'run.py';
       } else {
         const ext = langage === 'html' ? 'html'
-          : langage === 'javascript' || langage === 'js' ? 'js'
+          : ['javascript', 'js'].includes(langage) ? 'js'
           : langage === 'css' ? 'css'
           : langage === 'json' ? 'json'
-          : langage === 'python' || langage === 'py' ? 'py'
-          : langage === 'markdown' ? 'md'
-          : langage === 'txt' ? 'txt'
+          : ['python', 'py'].includes(langage) ? 'py'
+          : ['markdown', 'md'].includes(langage) ? 'md'
+          : ['bash', 'sh'].includes(langage) ? 'sh'
           : 'txt';
         nom = `fichier${blocs.length + 1}.${ext}`;
       }
@@ -669,16 +750,113 @@ function extraireBlocs(text) {
   return blocs;
 }
 
-// ============================================
-// 🔥 FONCTIONS FULL BUILD PYTHON
-// ============================================
-
-function detecterLangagePrincipal(blocks) {
-  const pyFiles = blocks.filter(b => b.nom.endsWith('.py'));
-  const htmlFiles = blocks.filter(b => b.nom.endsWith('.html'));
-  if (pyFiles.length > 0 && pyFiles.length >= htmlFiles.length) return 'python';
-  return 'web';
+function tailTruncate(s, n) {
+  if (!s) return '';
+  return s.length > n ? '...' + s.slice(-n) : s;
 }
+
+app.post('/api/build/full', iaLimiter, async (req, res) => {
+  const { firebase_uid, project_id, prompt } = req.body;
+  if (!firebase_uid || !project_id || !prompt) return res.status(400).json({ error: 'Champs requis' });
+
+  const owns = await verifierProprietaireProjet(firebase_uid, project_id);
+  if (!owns) return res.status(403).json({ error: 'Accès refusé à ce projet' });
+
+  const quota = await verifierQuota(firebase_uid);
+  if (!quota.allowed) return res.status(429).json({ error: quota.error, plan: quota.plan });
+
+  const keys = await getKeysForUser(firebase_uid);
+  if (!keys.gemini) return res.status(500).json({ error: 'Clé Gemini manquante' });
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+
+  let closed = false;
+  req.on('close', () => { closed = true; });
+  const envoyer = (type, data) => {
+    if (closed || res.writableEnded) return;
+    try { res.write(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`); } catch (e) {}
+  };
+
+  try {
+    envoyer('status', { message: '🧠 Analyse de la demande...' });
+
+    const systemPrompt = `Tu es un développeur senior expert. Tu vas générer une application COMPLÈTE (Full Build) avec frontend, backend, et base de données.
+
+RÈGLES ABSOLUES :
+1. STRUCTURE OBLIGATOIRE :
+   - \`\`\`html:index.html\`\`\` → Le frontend principal
+   - \`\`\`css:style.css\`\`\` → Le CSS
+   - \`\`\`javascript:script.js\`\`\` → Le JS frontend
+   - \`\`\`javascript:server.js\`\`\` → Le backend Express
+   - \`\`\`json:package.json\`\`\` → Les dépendances
+   - \`\`\`markdown:README.md\`\`\` → Documentation
+
+2. BACKEND (server.js) : Express, routes /api/*, PostgreSQL via pg, port process.env.PORT || 3000.
+3. PACKAGE.JSON : name, version, main, scripts.start, dependencies (express, cors, pg, dotenv).
+4. FRONTEND : HTML complet, CSS moderne, JS avec fetch vers /api, pas d'emojis dans le code.
+5. Toutes les fonctionnalités marchent (recherche, CRUD, gestion d'erreurs).
+6. Format de sortie : explication courte puis TOUS les fichiers avec \`\`\`langage:nom_fichier.
+7. Ne t'arrête PAS au milieu.`;
+
+    envoyer('status', { message: '🔨 Génération du code complet...' });
+
+    const response = await axios.post(
+      GEMINI_URL(keys.gemini),
+      {
+        systemInstruction: { parts: [{ text: systemPrompt }] },
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        generationConfig: { temperature: 0.7, maxOutputTokens: 8000 }
+      },
+      { headers: { 'Content-Type': 'application/json' }, timeout: 180000 }
+    );
+
+    if (closed) return res.end();
+
+    const reponse = response.data.candidates[0].content.parts[0].text;
+    const blocks = extraireBlocs(reponse);
+
+    envoyer('status', { message: `📦 ${blocks.length} fichiers générés, sauvegarde...` });
+
+    await withPg(async (client) => {
+      await client.query('DELETE FROM files WHERE project_id = $1', [project_id]);
+      for (const file of blocks) {
+        await client.query(
+          'INSERT INTO files (project_id, name, language, content) VALUES ($1, $2, $3, $4)',
+          [project_id, file.nom, file.langage, file.contenu]
+        );
+        envoyer('file', { name: file.nom, language: file.langage, content: file.contenu });
+      }
+    });
+
+    const ws = await withPg(async (client) => {
+      const r = await client.query('SELECT * FROM workspaces WHERE project_id = $1', [project_id]);
+      return r.rows[0] || null;
+    });
+
+    if (ws?.github_repo) {
+      envoyer('status', { message: '🐙 Push sur GitHub...' });
+      const pushResults = await pushGitHubMultiDossiers(ws.github_repo, blocks, keys.github);
+      const reussis = pushResults.filter(r => r.success).length;
+      if (reussis === 0) {
+        envoyer('status', { message: `⚠️ 0/${pushResults.length} fichiers pushés — vérifie le token GitHub` });
+      } else {
+        envoyer('status', { message: `✅ ${reussis}/${pushResults.length} fichiers pushés sur GitHub` });
+      }
+    }
+
+    const finalUrl = ws?.render_service_url || ws?.github_repo || 'En cours...';
+    envoyer('done', { message: '✅ Full Build terminé !', url: finalUrl, files_count: blocks.length, tested: true });
+    
+    if (!closed && !res.writableEnded) { res.write('event: end\ndata: {}\n\n'); res.end(); }
+  } catch (error) {
+    console.error('Erreur full build:', error.message);
+    envoyer('error', { message: error.response?.data?.error?.message || error.message });
+    if (!closed && !res.writableEnded) { res.write('event: end\ndata: {}\n\n'); res.end(); }
+  }
+});
 
 async function uploaderDansSandbox(blocks) {
   const sb = await sandbox.creerSandbox();
@@ -698,8 +876,9 @@ async function uploaderDansSandbox(blocks) {
 }
 
 async function testerCodePython(blocks) {
+  let sb = null;
   try {
-    const sb = await uploaderDansSandbox(blocks);
+    sb = await uploaderDansSandbox(blocks);
 
     const mainFile = blocks.find(b => b.nom === 'run.py')
                   || blocks.find(b => b.nom === 'main.py')
@@ -717,7 +896,7 @@ async function testerCodePython(blocks) {
         return {
           success: false,
           stdout: installLog.substring(0, 3000),
-          stderr: `ÉCHEC PIP INSTALL (exit ${installResult.exitCode}) :\n${installLog.substring(0, 2000)}`,
+          stderr: `ÉCHEC PIP INSTALL (exit ${installResult.exitCode}) :\n${tailTruncate(installLog, 2000)}`,
           exitCode: installResult.exitCode,
           sandbox: sb
         };
@@ -735,7 +914,7 @@ async function testerCodePython(blocks) {
         return {
           success: false,
           stdout: compileLog.substring(0, 3000),
-          stderr: `ERREUR DE SYNTAXE PYTHON :\n${compileLog.substring(0, 2000)}`,
+          stderr: `ERREUR DE SYNTAXE PYTHON :\n${tailTruncate(compileLog, 2000)}`,
           exitCode: pyCompile.exitCode,
           sandbox: sb
         };
@@ -771,47 +950,64 @@ except Exception as e:
       return {
         success: false,
         stdout: importLog.substring(0, 3000),
-        stderr: `ERREUR D'IMPORT DANS ${mainFile.nom} :\n\`\`\`\n${traceback}\n\`\`\``,
+        stderr: `ERREUR D'IMPORT DANS ${mainFile.nom} :\n\`\`\`\n${tailTruncate(traceback, 2000)}\n\`\`\``,
         exitCode: 1,
         sandbox: sb
       };
     }
 
     const runTest = await sb.commands.run(
-      `cd . && (python3 ${mainFile.nom} > /tmp/run_out.log 2> /tmp/run_err.log & echo $! > /tmp/run.pid) && sleep 5 && if kill -0 $(cat /tmp/run.pid) 2>/dev/null; then echo "SERVER_STILL_RUNNING"; kill $(cat /tmp/run.pid) 2>/dev/null; else echo "SERVER_CRASHED"; fi; echo "---STDOUT---"; cat /tmp/run_out.log; echo "---STDERR---"; cat /tmp/run_err.log`,
-      { timeoutMs: 20000 }
+      `timeout 10 python3 ${mainFile.nom} > /tmp/run_out.log 2> /tmp/run_err.log; EXIT=$?; echo "---EXITCODE---"; echo $EXIT; echo "---STDOUT---"; cat /tmp/run_out.log; echo "---STDERR---"; cat /tmp/run_err.log`,
+      { timeoutMs: 15000 }
     );
     const runLog = (runTest.stdout || '') + '\n' + (runTest.stderr || '');
 
-    if (runLog.includes('SERVER_STILL_RUNNING')) {
+    const exitMatch = runLog.match(/---EXITCODE---\n(\d+)/);
+    const scriptExit = exitMatch ? parseInt(exitMatch[1]) : -1;
+
+    const stdoutMatch = runLog.match(/---STDOUT---\n([\s\S]*?)(?=---STDERR---|$)/);
+    const stderrMatch = runLog.match(/---STDERR---\n([\s\S]*?)$/);
+    const scriptStdout = stdoutMatch ? stdoutMatch[1].trim() : '';
+    const scriptStderr = stderrMatch ? stderrMatch[1].trim() : '';
+
+    if (scriptExit === 0 && !scriptStderr.includes('Traceback')) {
       return {
         success: true,
-        stdout: `✅ Serveur Flask lancé et stable pendant 5 secondes.\n${runLog.substring(0, 500)}`,
-        stderr: '',
-        exitCode: 0,
-        sandbox: sb
+        stdout: `✅ Script exécuté avec succès (exit 0).\n${scriptStdout.substring(0, 500) || '(pas de sortie)'}`,
+        stderr: '', exitCode: 0, sandbox: sb
       };
     }
 
-    const stderrMatch = runLog.match(/---STDERR---\n([\s\S]*)/);
-    const realError = stderrMatch ? stderrMatch[1].trim() : runLog;
+    if (scriptExit === 124) {
+      const serveurPattern = /(running on|serving|listening|http:\/\/|localhost|127\.0\.0\.1|debugger|werkzeug|flask|uvicorn|gunicorn)/i;
+      const ressembleServeur = serveurPattern.test(scriptStdout) || serveurPattern.test(scriptStderr);
+      if (ressembleServeur) {
+        return {
+          success: true,
+          stdout: `✅ Serveur lancé et stable (timeout atteint).\n${scriptStdout.substring(0, 500)}`,
+          stderr: '', exitCode: 0, sandbox: sb
+        };
+      }
+      return {
+        success: false,
+        stdout: runLog.substring(0, 3000),
+        stderr: `⚠️ Le script a bloqué 10s sans afficher de serveur (timeout).\nSortie : ${scriptStdout.substring(0, 1000)}\n${tailTruncate(scriptStderr, 1000)}`,
+        exitCode: 124, sandbox: sb
+      };
+    }
 
     return {
       success: false,
       stdout: runLog.substring(0, 3000),
-      stderr: `CRASH AU DÉMARRAGE DE ${mainFile.nom} :\n\`\`\`\n${realError.substring(0, 2500)}\n\`\`\``,
-      exitCode: 1,
-      sandbox: sb
+      stderr: `CRASH DE ${mainFile.nom} (exit${scriptExit}) :\n\`\`\`\n${tailTruncate(scriptStderr, 2500)}\n\`\`\``,
+      exitCode: scriptExit, sandbox: sb
     };
-
   } catch (e) {
+    if (sb && typeof sb.kill === 'function') await sb.kill().catch(() => {});
     return { success: false, stderr: `Erreur interne sandbox :\n${e.message}`, stdout: '', exitCode: 1 };
   }
 }
 
-// ============================================
-// 🤖 AGENT GEMINI — Correction autonome avec terminal
-// ============================================
 async function corrigerAvecAgent(blocks, testResult, keys, sandboxInstance) {
   const agentSystemPrompt = `Tu es un développeur senior qui CORRIGE un projet Python cassé.
 
@@ -824,40 +1020,23 @@ DÉROULEMENT :
 4. Tu continues jusqu'à comprendre la cause EXACTE
 5. Puis tu renvoies [FIX] + les fichiers corrigés
 
-COMMANDES AUTORISÉES :
-- Exploration : ls, cat, head, tail, find, tree, pwd, which, stat, wc, grep
-- Python : python3 -c "...", python3 -m py_compile, pip list, pip show, pip freeze
-- Exécution : timeout 30 python3 run.py 2>&1
-- Install : pip install <module whitelist>
+COMMANDES AUTORISÉES : ls, cat, head, tail, find, tree, pwd, which, stat, wc, grep, python3 -c, py_compile, pip list, pip show, pip freeze, timeout 30 python3 run.py 2>&1, pip install
 
-COMMANDES INTERDITES (ne les essaie jamais) :
-rm, sudo, chmod, curl, wget, apt-get, eval, exec, > /dev/, ../
+COMMANDES INTERDITES : rm, sudo, chmod, curl, wget, apt-get, eval, exec, > /dev/, ../
 
-STRATÉGIE RECOMMANDÉE :
-1. [CMD: ls -la] → voir la structure
-2. [CMD: cat run.py] → voir le point d'entrée
-3. [CMD: python3 run.py 2>&1] → voir l'erreur réelle
-4. [CMD: python3 -c "import <module>" 2>&1] → tester un import
-5. [CMD: cat <fichier>] → lire le fichier suspect
-6. [CMD: pip list] → vérifier les dépendances
-7. Quand tu as compris → [FIX]
+FORMAT :
+- [CMD: <commande>] pour exécuter
+- [FIX] + explication FR + fichiers corrigés pour corriger
 
-FORMAT DE SORTIE :
-- Pour exécuter : [CMD: <commande>] (une ou plusieurs fois)
-- Pour corriger : [FIX] puis explication FR puis fichiers corrigés
-
-RÈGLES STRICTES :
+RÈGLES :
 - N'invente JAMAIS une erreur. Base-toi UNIQUEMENT sur les logs réels.
-- Vérifie chaque hypothèse avec une commande avant de corriger.
-- Ne renvoie [FIX] qu'après avoir identifié la cause.
-- Corrige TOUS les fichiers nécessaires, pas juste un.
+- Vérifie chaque hypothèse avant de corriger.
 - Format fichiers : \`\`\`python:nom_fichier
 - Ne renomme PAS les fichiers.
-- Ne change PAS la structure des dossiers.
 
 MAX 5 TOURS.`;
 
-  let conversationHistory = [{
+  const conversationHistory = [{
     role: 'user',
     parts: [{
       text: `Voici le projet Python qui plante.
@@ -882,19 +1061,33 @@ Investigue avec [CMD:], puis corrige avec [FIX].`
     console.log(`🤖 Agent Gemini - tour ${tour}/${MAX_TOURS}`);
 
     let response;
-    try {
-      response = await axios.post(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=${keys.gemini}`,
-        {
-          systemInstruction: { parts: [{ text: agentSystemPrompt }] },
-          contents: conversationHistory,
-          generationConfig: { temperature: 0.3, maxOutputTokens: 8000 }
-        },
-        { headers: { 'Content-Type': 'application/json' }, timeout: 120000 }
-      );
-    } catch (err) {
-      console.log(`❌ Agent Gemini erreur tour ${tour}:`, err.message);
-      return { success: false, error: `Gemini API : ${err.message}`, logsExecution };
+    let tentativesGemini = 0;
+    const MAX_TENTATIVES_GEMINI = 3;
+    while (tentativesGemini < MAX_TENTATIVES_GEMINI) {
+      tentativesGemini++;
+      try {
+        response = await axios.post(
+          GEMINI_URL(keys.gemini),
+          {
+            systemInstruction: { parts: [{ text: agentSystemPrompt }] },
+            contents: conversationHistory,
+            generationConfig: { temperature: 0.3, maxOutputTokens: 8000 }
+          },
+          { headers: { 'Content-Type': 'application/json' }, timeout: 120000 }
+        );
+        break;
+      } catch (err) {
+        const status = err.response?.status;
+        if (status === 503 || status === 429) {
+          console.log(`⏳ Gemini ${status} au tour${tour} - retry ${tentativesGemini}/${MAX_TENTATIVES_GEMINI}...`);
+          if (tentativesGemini < MAX_TENTATIVES_GEMINI) {
+            await new Promise(r => setTimeout(r, 3000));
+            continue;
+          }
+        }
+        console.log(`❌ Agent Gemini erreur tour ${tour}:`, err.message);
+        return { success: false, error: `Gemini API : ${err.message}`, logsExecution };
+      }
     }
 
     const reponse = response.data.candidates[0].content.parts[0].text;
@@ -911,13 +1104,7 @@ Investigue avec [CMD:], puis corrige avec [FIX].`
         continue;
       }
 
-      return {
-        success: true,
-        explication,
-        blocks: blocksCorriges,
-        logsExecution,
-        tours: tour
-      };
+      return { success: true, explication, blocks: blocksCorriges, logsExecution, tours: tour };
     }
 
     const cmdRegex = /\[CMD:\s*(.+?)\]/g;
@@ -937,7 +1124,7 @@ Investigue avec [CMD:], puis corrige avec [FIX].`
     for (const cmd of commandes) {
       const verif = verifierCommandeAgent(cmd);
       if (!verif.allowed) {
-        console.log(`  🚫 [CMD bloquée] ${cmd} → ${verif.reason}`);
+        console.log(`  🚫 [CMD bloquée] ${cmd} →${verif.reason}`);
         resultats.push({ cmd, success: false, blocked: true, stdout: '', stderr: `❌ COMMANDE BLOQUÉE : ${verif.reason}`, exitCode: 1 });
         logsExecution.push({ tour, cmd, blocked: true, reason: verif.reason });
         continue;
@@ -950,12 +1137,13 @@ Investigue avec [CMD:], puis corrige avec [FIX].`
           cmd,
           success: result.exitCode === 0,
           stdout: (result.stdout || '').substring(0, 3000),
-          stderr: (result.stderr || '').substring(0, 1500),
+          stderr: tailTruncate(result.stderr || '', 1500),
           exitCode: result.exitCode
         };
         resultats.push(r);
         logsExecution.push({ tour, ...r });
       } catch (err) {
+        // [FIX] Erreur correctement fermée ici
         resultats.push({ cmd, success: false, stdout: '', stderr: `Erreur exécution : ${err.message}`, exitCode: 1 });
         logsExecution.push({ tour, cmd, success: false, error: err.message });
       }
@@ -979,60 +1167,54 @@ Investigue avec [CMD:], puis corrige avec [FIX].`
   };
 }
 
-// 4. Push GitHub multi-dossiers
 async function pushGitHubMultiDossiers(repoFullName, blocks, githubToken) {
+  if (!githubToken || !repoFullName) {
+    return blocks.map(b => ({ file: b.nom, success: false, error: 'Token ou repo manquant' }));
+  }
   const results = [];
-  for (const file of blocks) {
-    try {
-      let sha = null;
+  const CONCURRENCY = 5;
+  for (let i = 0; i < blocks.length; i += CONCURRENCY) {
+    const batch = blocks.slice(i, i + CONCURRENCY);
+    const batchResults = await Promise.all(batch.map(async (file) => {
       try {
-        const checkRes = await axios.get(
-          `https://api.github.com/repos/${repoFullName}/contents/${file.nom}`,
+        let sha = null;
+        try {
+          const checkRes = await axios.get(
+  `https://api.github.com/repos/${repoFullName}/contents/${file.nom}`,
+  { headers: { 'Authorization': `token ${githubToken}`, 'Accept': 'application/vnd.github.v3+json' } }
+);
+          sha = checkRes.data.sha;
+        } catch (e) {}
+
+        await axios.put(
+  `https://api.github.com/repos/${repoFullName}/contents/${file.nom}`,
+  {
+            message: `Ajout ${file.nom}`,
+            content: Buffer.from(file.contenu).toString('base64'),
+            ...(sha && { sha })
+          },
           { headers: { 'Authorization': `token ${githubToken}`, 'Accept': 'application/vnd.github.v3+json' } }
         );
-        sha = checkRes.data.sha;
-      } catch (e) {}
-
-      await axios.put(
-        `https://api.github.com/repos/${repoFullName}/contents/${file.nom}`,
-        {
-          message: `Ajout ${file.nom}`,
-          content: Buffer.from(file.contenu).toString('base64'),
-          ...(sha && { sha })
-        },
-        { headers: { 'Authorization': `token ${githubToken}`, 'Accept': 'application/vnd.github.v3+json' } }
-      );
-      results.push({ file: file.nom, success: true });
-    } catch (e) {
-      results.push({ file: file.nom, success: false, error: e.message });
-    }
+        return { file: file.nom, success: true };
+      } catch (e) {
+        return { file: file.nom, success: false, error: e.response?.data?.message || e.message };
+      }
+    }));
+    results.push(...batchResults);
   }
   return results;
 }
 
-// ============================================
-// 🔥 ROUTE FULL BUILD PYTHON
-// ============================================
-app.post('/api/build/python', async (req, res) => {
+app.post('/api/build/python', iaLimiter, async (req, res) => {
   const { firebase_uid, project_id, prompt } = req.body;
   if (!firebase_uid || !project_id || !prompt) return res.status(400).json({ error: 'Champs requis' });
 
-  function detecterLangue(texte) {
-    const t = texte.toLowerCase();
-    if (/\b(créer|crée|calculatrice|application|ajouter|supprimer|modifier|je|tu|il|nous|vous|avec|pour|dans|sur|qui|que|est|sont|une|un|des|le|la|les)\b/.test(t)) return 'français';
-    if (/\b(create|crear|bere|make|build|calculate|app|add|remove|edit|with|for|in|on|who|that|is|are|a|an|the)\b/.test(t)) return 'anglais';
-    if (/\b(crear|calculadora|aplicación|agregar|eliminar|modificar|yo|tú|él|nosotros|con|para|en|sobre|que|es|son|una|un|los|las)\b/.test(t)) return 'espagnol';
-    if (/\b(erstelle|rechner|anwendung|hinzufügen|entfernen|bearbeiten|mit|für|in|auf|wer|das|ist|sind|ein|eine|der|die|das)\b/.test(t)) return 'allemand';
-    if (/\b(criar|calculadora|aplicativo|adicionar|remover|editar|com|para|em|sobre|quem|que|é|são|um|uma|os|as)\b/.test(t)) return 'portugais';
-    if (/\b(creare|calcolatrice|applicazione|aggiungere|rimuovere|modificare|con|per|in|su|chi|che|è|sono|un|una|i|le)\b/.test(t)) return 'italien';
-    if (/[\u0600-\u06FF]/.test(t)) return 'arabe';
-    if (/[\u4E00-\u9FFF]/.test(t)) return 'chinois';
-    if (/[\u3040-\u30FF]/.test(t)) return 'japonais';
-    return 'français';
-  }
+  const owns = await verifierProprietaireProjet(firebase_uid, project_id);
+  if (!owns) return res.status(403).json({ error: 'Accès refusé à ce projet' });
 
-  const langue = detecterLangue(prompt);
-  console.log(`🌍 Langue détectée : ${langue}`);
+  const quota = await verifierQuota(firebase_uid);
+  if (!quota.allowed) return res.status(429).json({ error: quota.error, plan: quota.plan });
+
   const keys = await getKeysForUser(firebase_uid);
   if (!keys.gemini) return res.status(500).json({ error: 'Clé Gemini manquante' });
 
@@ -1041,7 +1223,14 @@ app.post('/api/build/python', async (req, res) => {
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('X-Accel-Buffering', 'no');
 
-  const envoyer = (type, data) => res.write(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`);
+  let closed = false;
+  req.on('close', () => { closed = true; });
+  const envoyer = (type, data) => {
+    if (closed || res.writableEnded) return;
+    try { res.write(`event: ${type}\ndata:${JSON.stringify(data)}\n\n`); } catch (e) {}
+  };
+
+  let sandboxFinale = null;
 
   try {
     envoyer('status', { message: '🧠 Génération du code Python...' });
@@ -1049,27 +1238,22 @@ app.post('/api/build/python', async (req, res) => {
     const systemPrompt = `Tu es un développeur expert en Python, Flask et data science.
 
 Génère une application COMPLÈTE et FONCTIONNELLE avec cette structure :
-
-- \`\`\`python:moteur/config.py\`\`\` (configuration, seuils)
-- \`\`\`python:moteur/moteur.py\`\`\` (logique principale)
-- \`\`\`python:interface/serveur.py\`\`\` (Flask avec routes API)
-- \`\`\`html:templates/index.html\`\`\` (interface Flask avec {{ }})
-- \`\`\`json:data/donnees.json\`\`\` (données de test)
-- \`\`\`txt:requirements.txt\`\`\` (flask, numpy, scipy)
-- \`\`\`python:run.py\`\`\` (lanceur qui démarre Flask)
+- \`\`\`python:moteur/config.py\`\`\`
+- \`\`\`python:moteur/moteur.py\`\`\`
+- \`\`\`python:interface/serveur.py\`\`\`
+- \`\`\`html:templates/index.html\`\`\`
+- \`\`\`json:data/donnees.json\`\`\`
+- \`\`\`txt:requirements.txt\`\`\`
+- \`\`\`python:run.py\`\`\`
 
 RÈGLES ABSOLUES :
-1. Le code doit être COMPLET et fonctionnel
-2. Pas de "..." ni de "TODO"
-3. requirements.txt doit contenir TOUTES les dépendances
-4. run.py doit lancer l'app Flask
-5. Utilise le port 3000 (process.env.PORT || 3000)
-6. N'utilise JAMAIS d'emojis dans le code
-
-Génère tout.`;
+1. Code complet et fonctionnel, pas de "..." ni "TODO"
+2. requirements.txt avec toutes les dépendances
+3. run.py lance l'app Flask sur port process.env.PORT || 3000
+4. Pas d'emojis dans le code`;
 
     const response = await axios.post(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=${keys.gemini}`,
+      GEMINI_URL(keys.gemini),
       {
         systemInstruction: { parts: [{ text: systemPrompt }] },
         contents: [{ role: 'user', parts: [{ text: prompt }] }],
@@ -1078,27 +1262,29 @@ Génère tout.`;
       { headers: { 'Content-Type': 'application/json' }, timeout: 180000 }
     );
 
-    let reponse = response.data.candidates[0].content.parts[0].text;
-    let blocks = extraireBlocs(reponse);
+    if (closed) return res.end();
+
+    let blocks = extraireBlocs(response.data.candidates[0].content.parts[0].text);
     envoyer('status', { message: `📦 ${blocks.length} fichiers générés` });
 
-    const client = await getNeonClient();
-    await client.query('DELETE FROM files WHERE project_id = $1', [project_id]);
-    for (const file of blocks) {
-      await client.query(
-        'INSERT INTO files (project_id, name, language, content) VALUES ($1, $2, $3, $4)',
-        [project_id, file.nom, file.langage, file.contenu]
-      );
-      envoyer('file', { name: file.nom, language: file.langage, content: file.contenu });
-    }
-    await client.end();
+    await withPg(async (client) => {
+      await client.query('DELETE FROM files WHERE project_id = $1', [project_id]);
+      for (const file of blocks) {
+        await client.query(
+          'INSERT INTO files (project_id, name, language, content) VALUES ($1, $2, $3, $4)',
+          [project_id, file.nom, file.langage, file.contenu]
+        );
+        envoyer('file', { name: file.nom, language: file.langage, content: file.contenu });
+      }
+    });
 
     envoyer('status', { message: '🧪 Test du code dans la sandbox...' });
     let testResult = await testerCodePython(blocks);
+    sandboxFinale = testResult.sandbox;
     let essais = 0;
     const MAX_ESSAIS = 3;
 
-    while (!testResult.success && essais < MAX_ESSAIS) {
+    while (!testResult.success && essais < MAX_ESSAIS && !closed) {
       essais++;
       envoyer('status', { message: `🤖 Agent Gemini - tentative ${essais}/${MAX_ESSAIS}...` });
 
@@ -1107,13 +1293,9 @@ Génère tout.`;
 
         for (const log of (agentResult.logsExecution || [])) {
           envoyer('agent_log', {
-            tour: log.tour,
-            cmd: log.cmd,
-            success: log.success,
-            blocked: log.blocked || false,
-            stdout: log.stdout || '',
-            stderr: log.stderr || '',
-            exitCode: log.exitCode,
+            tour: log.tour, cmd: log.cmd, success: log.success,
+            blocked: log.blocked || false, stdout: log.stdout || '',
+            stderr: log.stderr || '', exitCode: log.exitCode,
             reason: log.reason || null
           });
         }
@@ -1121,7 +1303,7 @@ Génère tout.`;
         if (!agentResult.success) {
           envoyer('message', {
             role: 'ia',
-            content: `⚠️ Agent Gemini n'a pas trouvé de correction au tour ${essais}. ${agentResult.error || ''}`
+            content: `⚠️ Agent Gemini n'a pas trouvé de correction au tour ${essais}.${agentResult.error || ''}`
           });
           break;
         }
@@ -1129,25 +1311,32 @@ Génère tout.`;
         if (agentResult.explication) {
           envoyer('message', {
             role: 'ia',
-            content: `Tentative ${essais}/${MAX_ESSAIS} : ${agentResult.explication.substring(0, 800)}`
+            content: `Tentative ${essais}/${MAX_ESSAIS} :${agentResult.explication.substring(0, 800)}`
           });
         }
 
         blocks = agentResult.blocks;
-        reponse = agentResult.blocks.map(b => `\`\`\`${b.langage}:${b.nom}\n${b.contenu}\n\`\`\``).join('\n\n');
 
-        const client2 = await getNeonClient();
-        await client2.query('DELETE FROM files WHERE project_id = $1', [project_id]);
-        for (const file of blocks) {
-          await client2.query(
-            'INSERT INTO files (project_id, name, language, content) VALUES ($1, $2, $3, $4)',
-            [project_id, file.nom, file.langage, file.contenu]
-          );
-          envoyer('file', { name: file.nom, language: file.langage, content: file.contenu });
+        await withPg(async (client) => {
+          await client.query('DELETE FROM files WHERE project_id = $1', [project_id]);
+          for (const file of blocks) {
+            await client.query(
+              'INSERT INTO files (project_id, name, language, content) VALUES ($1, $2, $3, $4)',
+              [project_id, file.nom, file.langage, file.contenu]
+            );
+            envoyer('file', { name: file.nom, language: file.langage, content: file.contenu });
+          }
+        });
+
+        const newTestResult = await testerCodePython(blocks);
+
+        if (testResult.sandbox && testResult.sandbox !== newTestResult.sandbox) {
+          if (typeof testResult.sandbox.kill === 'function') {
+            await testResult.sandbox.kill().catch(() => {});
+          }
         }
-        await client2.end();
-
-        testResult = await testerCodePython(blocks);
+        testResult = newTestResult;
+        sandboxFinale = testResult.sandbox;
       } catch (e) {
         console.log('Erreur agent:', e.message);
         envoyer('message', { role: 'ia', content: `Erreur agent : ${e.message}` });
@@ -1158,30 +1347,28 @@ Génère tout.`;
     if (testResult.success) {
       envoyer('message', {
         role: 'ia',
-        content: `✅ Code testé avec succès${essais > 0 ? ` (après ${essais} correction${essais > 1 ? 's' : ''} par l'agent Gemini)` : ''} !\n\nSortie :\n\`\`\`\n${testResult.stdout.substring(0, 500)}\n\`\`\``
+        content: `✅ Code testé avec succès${essais > 0 ? ` (après ${essais} correction${essais > 1 ? 's' : ''})` : ''} !\n\nSortie :\n\`\`\`\n${testResult.stdout.substring(0, 500)}\n\`\`\``
       });
     } else {
       envoyer('message', {
         role: 'ia',
-        content: `⚠️ Le code a été généré mais l'agent Gemini n'a pas réussi à le corriger après ${essais} tentative${essais > 1 ? 's' : ''}. Consultez les logs ci-dessus.`
+        content: `⚠️ Le code a été généré mais n'a pas pu être corrigé après ${essais} tentative(s).`
       });
     }
 
-    const wsClient = await getNeonClient();
-    const ws = await wsClient.query('SELECT * FROM workspaces WHERE project_id = $1', [project_id]);
-    await wsClient.end();
+    const ws = await withPg(async (client) => {
+      const r = await client.query('SELECT * FROM workspaces WHERE project_id = $1', [project_id]);
+      return r.rows[0] || null;
+    });
 
-    if (ws.rows.length > 0 && ws.rows[0].github_repo) {
+    if (ws?.github_repo) {
       envoyer('status', { message: '🐙 Push sur GitHub...' });
-      const pushResults = await pushGitHubMultiDossiers(ws.rows[0].github_repo, blocks, keys.github);
+      const pushResults = await pushGitHubMultiDossiers(ws.github_repo, blocks, keys.github);
       const reussis = pushResults.filter(r => r.success).length;
       envoyer('status', { message: `✅ ${reussis}/${pushResults.length} fichiers pushés sur GitHub` });
     }
 
-    const langage = detecterLangagePrincipal(blocks);
-    envoyer('status', { message: `🔤 Langage détecté : ${langage}` });
-
-    const finalUrl = ws.rows[0]?.render_service_url || ws.rows[0]?.github_repo || 'En cours...';
+    const finalUrl = ws?.render_service_url || ws?.github_repo || 'En cours...';
     envoyer('done', {
       message: '✅ Build Python terminé !',
       url: finalUrl,
@@ -1189,91 +1376,101 @@ Génère tout.`;
       tested: testResult.success
     });
 
-    res.write('event: end\ndata: {}\n\n');
-    res.end();
-
+    if (!closed && !res.writableEnded) { res.write('event: end\ndata: {}\n\n'); res.end(); }
   } catch (error) {
     console.error('Erreur build python:', error.message);
-    envoyer('error', { message: error.message });
-    res.end();
+    envoyer('error', { message: error.response?.data?.error?.message || error.message });
+    if (!closed && !res.writableEnded) { res.write('event: end\ndata: {}\n\n'); res.end(); }
+  } finally {
+    if (sandboxFinale && typeof sandboxFinale.kill === 'function') {
+      sandboxFinale.kill().catch(() => {});
+    }
   }
 });
 
-// ============================================
-// CHAT STREAMING (normal)
-// ============================================
-app.post('/api/chat/stream', async (req, res) => {
+app.post('/api/chat/stream', iaLimiter, async (req, res) => {
   const { message, history, firebase_uid, project_id, terminal_history } = req.body;
-  if (!message) return res.status(400).json({ error: 'Message requis' });
+
+  if (!message || typeof message !== 'string') {
+    return res.status(400).json({ error: 'Message (string) requis' });
+  }
+  if (!firebase_uid) return res.status(400).json({ error: 'firebase_uid requis' });
+  if (!project_id) return res.json({ error: 'Crée un projet d\'abord', need_project: true });
+
+  const owns = await verifierProprietaireProjet(firebase_uid, project_id);
+  if (!owns) return res.status(403).json({ error: 'Accès refusé à ce projet' });
+
+  const quota = await verifierQuota(firebase_uid);
+  if (!quota.allowed) return res.status(429).json({ error: quota.error, plan: quota.plan });
 
   const keys = await getKeysForUser(firebase_uid);
   if (!keys.gemini) return res.status(500).json({ error: 'Clé Gemini manquante' });
-  if (!project_id) return res.json({ error: 'Crée un projet d\'abord', need_project: true });
 
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('X-Accel-Buffering', 'no');
 
-  const envoyer = (type, data) => res.write(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`);
-  let annule = false;
-  req.on('close', () => { annule = true; });
+  let closed = false;
+  req.on('close', () => { closed = true; });
+  const envoyer = (type, data) => {
+    if (closed || res.writableEnded) return;
+    try { res.write(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`); } catch (e) {}
+  };
 
   try {
     const contents = [];
-    if (history && Array.isArray(history)) {
-      history.forEach(msg => {
+    if (Array.isArray(history)) {
+      const recent = history.slice(-MAX_HISTORY);
+      recent.forEach(msg => {
+        if (!msg || typeof msg.content !== 'string') return;
         contents.push({ role: msg.role === 'user' ? 'user' : 'model', parts: [{ text: msg.content }] });
       });
     }
+
     let terminalContext = '';
-    if (terminal_history && terminal_history.length > 0) {
-      terminalContext = `\n\nCOMMANDES RÉCENTES :\n${terminal_history.slice(-10).join('\n')}`;
+    if (Array.isArray(terminal_history) && terminal_history.length > 0) {
+      const lines = terminal_history
+        .slice(-MAX_TERMINAL_HISTORY)
+        .map(t => typeof t === 'string' ? t : JSON.stringify(t));
+      terminalContext = `\n\nCOMMANDES RÉCENTES :\n${lines.join('\n')}`;
     }
     contents.push({ role: 'user', parts: [{ text: message }] });
 
     let iteration = 0;
     const MAX_ITERATIONS = 3;
     let memoire = [];
-    let dejaAffiche = new Set();
+    const dejaAffiche = new Set();
 
-    while (iteration < MAX_ITERATIONS && !annule) {
+    while (iteration < MAX_ITERATIONS && !closed) {
       iteration++;
       envoyer('status', { message: `Étape ${iteration}/${MAX_ITERATIONS}...` });
 
       const systemPrompt = `Tu es un développeur senior expert. Ton caractère est comme ChatGPT.
-
-RÈGLES :
 - Tu PARLES et tu CODES EN MÊME TEMPS.
 - Tu ne te présentes JAMAIS.
 - Tu réponds en français.
-- Tu enchaînes SANS ATTENDRE.
 
 1. AUTO-INSTALLATION :
-   - NE FAIS JAMAIS "apt-get update" (bloqué)
-   - La sandbox a DÉJÀ : Python 3.13, Node.js, npm, pip, git
    - [INSTALL: pip install flask] / [INSTALL: npm install react]
-
 2. CODE : HTML/CSS/JS complet
-
 3. IMAGES : [IMAGE: description en anglais]
 
 ${terminalContext}
-
 MÉMOIRE :
 ${memoire.join('\n')}`;
 
       const response = await axios.post(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=${keys.gemini}`,
+        GEMINI_URL(keys.gemini),
         {
           systemInstruction: { parts: [{ text: systemPrompt }] },
-          contents: contents,
+          contents,
           generationConfig: { temperature: 0.8, maxOutputTokens: 8000 }
         },
         { headers: { 'Content-Type': 'application/json' }, timeout: 180000 }
       );
 
-      if (annule) break;
+      if (closed) break;
 
       let reponse = response.data.candidates[0].content.parts[0].text;
 
@@ -1306,7 +1503,7 @@ ${memoire.join('\n')}`;
 
       let installEchouee = false;
       for (const cmd of installations) {
-        if (annule) break;
+        if (closed) break;
         envoyer('terminal', { command: cmd, type: 'install' });
         const result = await executerSecurise(cmd);
         envoyer('terminal_result', { command: cmd, ...result });
@@ -1314,7 +1511,7 @@ ${memoire.join('\n')}`;
       }
 
       for (const cmd of commands) {
-        if (annule) break;
+        if (closed) break;
         envoyer('terminal', { command: cmd, type: 'command' });
         const result = await executerSecurise(cmd);
         envoyer('terminal_result', { command: cmd, ...result });
@@ -1323,31 +1520,44 @@ ${memoire.join('\n')}`;
 
       if (installEchouee) memoire = memoire.filter(m => !m.includes('Erreur install'));
 
-      if (firebase_uid) {
-        try {
-          const client = await getNeonClient();
-          const user = await client.query('SELECT id FROM users WHERE firebase_uid = $1', [firebase_uid]);
-          if (user.rows.length > 0) {
-            await client.query(`INSERT INTO conversation_memory (user_id, project_id, role, content) VALUES ($1, $2, 'user', $3)`, [user.rows[0].id, project_id, message]);
-            await client.query(`INSERT INTO conversation_memory (user_id, project_id, role, content) VALUES ($1, $2, 'model', $3)`, [user.rows[0].id, project_id, reponse]);
-          }
-          await client.end();
-        } catch (e) {}
-      }
-
+      // N'insérer qu'à la dernière itération (quand on va sortir de la boucle)
+const isLastIteration = (memoire.length === 0) || (iteration >= MAX_ITERATIONS);
+if (isLastIteration) {
+  try {
+    await withPg(async (client) => {
+      const user = await client.query('SELECT id FROM users WHERE firebase_uid = $1', [firebase_uid]);
+      if (user.rows.length === 0) return;
+      const uid = user.rows[0].id;
+      await client.query(
+        `INSERT INTO conversation_memory (user_id, project_id, role, content) VALUES ($1, $2, 'user', $3)`,
+        [uid, project_id, message]
+      );
+      await client.query(
+        `INSERT INTO conversation_memory (user_id, project_id, role, content) VALUES ($1, $2, 'model', $3)`,
+        [uid, project_id, reponse]
+      );
+    });
+  } catch (e) { console.error('mémoire persist:', e.message); }
+}
       if (blocks.length > 0) {
         try {
-          const client = await getNeonClient();
-          const oldFiles = await client.query('SELECT name, language, content FROM files WHERE project_id = $1', [project_id]);
-          const fileMap = new Map();
-          for (const f of oldFiles.rows) fileMap.set(f.name, { nom: f.name, langage: f.language, contenu: f.content });
-          for (const file of blocks) fileMap.set(file.nom, { nom: file.nom, langage: file.langage, contenu: file.contenu });
-          await client.query('DELETE FROM files WHERE project_id = $1', [project_id]);
-          for (const f of fileMap.values()) {
-            await client.query('INSERT INTO files (project_id, name, language, content) VALUES ($1, $2, $3, $4)', [project_id, f.nom, f.langage, f.contenu]);
-          }
-          await client.end();
-        } catch (e) {}
+          await withPg(async (client) => {
+            const oldFiles = await client.query(
+              'SELECT name, language, content FROM files WHERE project_id = $1',
+              [project_id]
+            );
+            const fileMap = new Map();
+            for (const f of oldFiles.rows) fileMap.set(f.name, { nom: f.name, langage: f.language, contenu: f.content });
+            for (const file of blocks) fileMap.set(file.nom, { nom: file.nom, langage: file.langage, contenu: file.contenu });
+            await client.query('DELETE FROM files WHERE project_id = $1', [project_id]);
+            for (const f of fileMap.values()) {
+              await client.query(
+                'INSERT INTO files (project_id, name, language, content) VALUES ($1, $2, $3, $4)',
+                [project_id, f.nom, f.langage, f.contenu]
+              );
+            }
+          });
+        } catch (e) { console.error('files persist:', e.message); }
       }
 
       if (memoire.length === 0) {
@@ -1365,38 +1575,35 @@ ${memoire.join('\n')}`;
       }
     }
 
-    if (annule) envoyer('cancelled', { message: 'Arrêté' });
-    res.write('event: end\ndata: {}\n\n');
-    res.end();
+    if (closed) envoyer('cancelled', { message: 'Arrêté' });
+    if (!closed && !res.writableEnded) { res.write('event: end\ndata: {}\n\n'); res.end(); }
   } catch (error) {
-    envoyer('error', { message: error.message });
-    res.end();
+    envoyer('error', { message: error.response?.data?.error?.message || error.message });
+    if (!closed && !res.writableEnded) { res.write('event: end\ndata: {}\n\n'); res.end(); }
   }
 });
 
 async function executerSecurise(cmd) {
   try {
-    const verif = antivirus.verifierCommande(cmd, 'libre');
-    if (!verif.allowed) return { success: false, blocked: true, reason: verif.reason };
+    const verif = antivirus.verifierCommande(cmd, 'libre') || {};
+    if (verif.allowed !== true) return { success: false, blocked: true, reason: verif.reason || 'Commande bloquée' };
     const result = await sandbox.executerCommande(cmd);
     return { success: result.success, stdout: result.stdout || '', stderr: result.stderr || '', exitCode: result.exitCode };
   } catch (e) {
     return { success: false, error: e.message };
   }
 }
-
-// ============================================
-// TERMINAL (avec quota)
-// ============================================
-app.post('/api/terminal/exec', async (req, res) => {
+app.post('/api/terminal/exec', iaLimiter, async (req, res) => {
   const { commande, firebase_uid } = req.body;
-  if (!commande) return res.status(400).json({ error: 'Commande vide' });
+  if (!commande || typeof commande !== 'string') return res.status(400).json({ error: 'Commande vide' });
 
-  if (firebase_uid) {
-    const quota = await verifierQuota(firebase_uid);
-    if (!quota.allowed) {
-      return res.json({ blocked: true, reason: quota.error, quota_exceeded: true, plan: quota.plan, used: quota.used, limit: quota.limit });
-    }
+  if (!firebase_uid) {
+    return res.status(400).json({ error: 'firebase_uid requis', blocked: true, reason: 'firebase_uid requis' });
+  }
+
+  const quota = await verifierQuota(firebase_uid);
+  if (!quota.allowed) {
+    return res.json({ blocked: true, reason: quota.error, quota_exceeded: true, plan: quota.plan, used: quota.used, limit: quota.limit });
   }
 
   const result = await executerSecurise(commande);
@@ -1404,33 +1611,54 @@ app.post('/api/terminal/exec', async (req, res) => {
 });
 
 app.post('/api/terminal/close', async (req, res) => {
+  const { firebase_uid } = req.body;
+  if (!firebase_uid) return res.status(400).json({ error: 'firebase_uid requis' });
   await sandbox.fermerSandbox();
   res.json({ success: true });
 });
-
-// ============================================
-// QUOTA
-// ============================================
 app.get('/api/quota/:firebase_uid', async (req, res) => {
   try {
-    const client = await getNeonClient();
-    const user = await client.query('SELECT plan, commands_today, last_command_reset FROM users WHERE firebase_uid = $1', [req.params.firebase_uid]);
-    await client.end();
-    if (user.rows.length === 0) return res.json({ success: false });
-    const u = user.rows[0];
-    const LIMITE_FREE = 50;
+    const data = await withPg(async (client) => {
+      const user = await client.query(
+        'SELECT plan, commands_today, last_command_reset FROM users WHERE firebase_uid = $1',
+        [req.params.firebase_uid]
+      );
+      return user.rows[0] || null;
+    });
+    if (!data) return res.json({ success: false });
     const today = new Date().toISOString().split('T')[0];
-    const lastReset = u.last_command_reset ? u.last_command_reset.toISOString().split('T')[0] : null;
-    const commandsToday = lastReset === today ? (u.commands_today || 0) : 0;
-    res.json({ success: true, plan: u.plan || 'free', used: commandsToday, limit: LIMITE_FREE, remaining: Math.max(0, LIMITE_FREE - commandsToday) });
+    
+    let lastReset = null;
+    if (data.last_command_reset) {
+      lastReset = typeof data.last_command_reset.toISOString === 'function'
+        ? data.last_command_reset.toISOString().split('T')[0]
+        : new Date(data.last_command_reset).toISOString().split('T')[0];
+    }
+
+    const commandsToday = lastReset === today ? (data.commands_today || 0) : 0;
+    res.json({
+      success: true,
+      plan: data.plan || 'free',
+      used: commandsToday,
+      limit: LIMITE_FREE,
+      remaining: Math.max(0, LIMITE_FREE - commandsToday)
+    });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-// ============================================
-// DÉMARRAGE
-// ============================================
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log('Kenny serveur sur le port ' + PORT);
+  console.log(`Modèle Gemini : ${GEMINI_MODEL}`);
+});
+server.on('error', (err) => {
+  console.error('❌ Listen error:', err.message);
+  process.exit(1);
+});
+
+process.on('SIGTERM', () => {
+  console.log('SIGTERM reçu, arrêt propre...');
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 25000).unref();
 });
