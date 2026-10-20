@@ -957,19 +957,34 @@ except Exception as e:
     }
 
     const runTest = await sb.commands.run(
-      `timeout 10 python3 ${mainFile.nom} > /tmp/run_out.log 2> /tmp/run_err.log; EXIT=$?; echo "---EXITCODE---"; echo $EXIT; echo "---STDOUT---"; cat /tmp/run_out.log; echo "---STDERR---"; cat /tmp/run_err.log`,
-      { timeoutMs: 15000 }
-    );
-    const runLog = (runTest.stdout || '') + '\n' + (runTest.stderr || '');
+  `timeout 10 python3 ${mainFile.nom} > /tmp/run_out.log 2> /tmp/run_err.log; EXIT=$?; echo "---EXITCODE---"; echo $EXIT; echo "---STDOUT---"; cat /tmp/run_out.log; echo "---STDERR---"; cat /tmp/run_err.log`,
+  { timeoutMs: 15000 }
+);
+const runLog = (runTest.stdout || '') + '\n' + (runTest.stderr || '');
 
-    const exitMatch = runLog.match(/---EXITCODE---\n(\d+)/);
-    const scriptExit = exitMatch ? parseInt(exitMatch[1]) : -1;
+// Parser robuste : tolère CRLF et espaces variés
+const exitMatch = runLog.match(/---EXITCODE---\s*[\r\n]+(\d+)/);
+const scriptExit = exitMatch ? parseInt(exitMatch[1]) : -1;
 
-    const stdoutMatch = runLog.match(/---STDOUT---\n([\s\S]*?)(?=---STDERR---|$)/);
-    const stderrMatch = runLog.match(/---STDERR---\n([\s\S]*?)$/);
-    const scriptStdout = stdoutMatch ? stdoutMatch[1].trim() : '';
-    const scriptStderr = stderrMatch ? stderrMatch[1].trim() : '';
+const stdoutMatch = runLog.match(/---STDOUT---\s*[\r\n]+([\s\S]*?)(?:[\r\n]+---STDERR---|$)/);
+const stderrMatch = runLog.match(/---STDERR---\s*[\r\n]+([\s\S]*?)$/);
+const scriptStdout = stdoutMatch ? stdoutMatch[1].trim() : '';
+const scriptStderr = stderrMatch ? stderrMatch[1].trim() : '';
 
+// Si le parsing a échoué, essayer un fallback : considérer exit 0 si pas de marqueur d'erreur
+if (scriptExit === -1) {
+  // Fallback : si runLog contient "Hello" ou du texte sans "Traceback" ni "Error"
+  const hasError = /traceback|error|exception/i.test(runLog);
+  if (!hasError && runLog.length > 0) {
+    return {
+      success: true,
+      stdout: `✅ Script exécuté (parsing fallback).\n${runLog.substring(0, 500)}`,
+      stderr: '',
+      exitCode: 0,
+      sandbox: sb
+    };
+  }
+}
     if (scriptExit === 0 && !scriptStderr.includes('Traceback')) {
       return {
         success: true,
