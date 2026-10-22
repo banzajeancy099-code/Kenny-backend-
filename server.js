@@ -50,8 +50,16 @@ const GLOBAL_KEYS = {
   cloudflareAccount: process.env.CLOUDFLARE_ACCOUNT_ID,
   render: process.env.RENDER_TOKEN,
   renderOwner: process.env.RENDER_OWNER_ID,
-  e2b: process.env.E2B_API_KEY
+  e2b: process.env.E2B_API_KEY,
+  groq: process.env.GROQ_API_KEY,              
+  openrouter: process.env.OPENROUTER_API_KEY,  
+  
 };
+
+// ============================================
+// 🔥 SUIVI DES BUILDS EN COURS (pour /api/build/status)
+// ============================================
+const buildsEnCours = new Map();
 
 // [FIX #22] Clé d'encryption obligatoire hors development
 const ENCRYPTION_KEY_RAW = process.env.ENCRYPTION_KEY;
@@ -466,15 +474,14 @@ app.post('/api/env/test', iaLimiter, async (req, res) => {
       results[key] = '✅ OK';
     } else if (k === 'RENDER_OWNER_ID' || k === 'RENDER_OWNER') {
       results[key] = /^[a-z0-9]+$/i.test(value) ? '✅ Format plausible' : '⚠️ Format douteux';
-      } else if (k === 'E2B_API_KEY' || k === 'E2B') {
-    results[key] = '⚠️ Test non implémenté';
-  } else {
-    results[key] = '⚠️ Type inconnu';
-  }
-
-  } catch (e) {
-    results[key] = '❌ ' + (e.response?.status || e.message);
-  }
+         } else if (k === 'E2B_API_KEY' || k === 'E2B') {
+      results[key] = '⚠️ Test non implémenté';
+    } else {
+      results[key] = '⚠️ Type inconnu';
+    }
+} catch (e) {
+  results[key] = '❌ ' + (e.response?.status || e.message);
+}
   res.json({ success: true, results });
 });
 
@@ -590,7 +597,7 @@ async function creerProjetNeon(name, neonKey) {
 
 async function creerServiceRender(name, repoUrl, userToken, ownerId, langage = 'web') {
   if (!userToken || !ownerId) return { success: false, skipped: true, reason: 'Token Render non configuré' };
-  if (!repoUrl) return { success: false, skipped: true, reason: 'Repo GitHub indisponible' };
+  if (!repoUrl)return { success: false, skipped: true, reason: 'Repo GitHub indisponible' };
   try {
     const serviceName = 'kenny-' + name.toLowerCase().replace(/[^a-z0-9-]/g, '-').substring(0, 40) + '-' + Date.now().toString(36);
 
@@ -636,6 +643,9 @@ const workspaceLimiter = rateLimit({
 
 app.post('/api/workspaces/create', workspaceLimiter, async (req, res) => {
   const { firebase_uid, project_id, project_name } = req.body;
+  if (!firebase_uid || !project_id || !project_name) {
+    return res.status(400).json({ error: 'Champs requis' });
+  }
   try {
     const workspaceId = await withPg(async (client) => {
       const user = await client.query('SELECT id FROM users WHERE firebase_uid = $1', [firebase_uid]);
@@ -698,7 +708,7 @@ if (existing.rows.length > 0) {
       ]);
     });
 
-    res.json({ success: true, workspace: { github: githubResult, neon: neonResult, render: renderResult, cloudflare: cloudflareResult } });
+        res.json({ success: true, workspace: { github: githubResult, neon: neonResult, render: renderResult, cloudflare: cloudflareResult } });
   } catch (error) {
     res.status(error.status || 500).json({ error: error.message });
   }
@@ -754,7 +764,92 @@ function tailTruncate(s, n) {
   if (!s) return '';
   return s.length > n ? '...' + s.slice(-n) : s;
 }
+// ============================================
+// 🔥 PROVIDERS IA SPÉCIALISÉS PAR RÔLE
+// ============================================
 
+// --- Groq : GÉNÉRATION DE CODE (rapide, 1000 req/jour) ---
+async function appelGroqCode(messages, systemPrompt) {
+  if (!GLOBAL_KEYS.groq) throw new Error('Clé Groq manquante');
+  
+  const response = await axios.post(
+    'https://api.groq.com/openai/v1/chat/completions',
+    {
+      model: 'qwen/qwen3.8-27b',
+      messages: [
+        { role: 'system', content: systemPrompt },
+        ...messages
+      ],
+      temperature: 0.7,
+      max_tokens: 8000
+    },
+    {
+      headers: {
+        'Authorization': `Bearer ${GLOBAL_KEYS.groq}`,
+        'Content-Type': 'application/json'
+      },
+      timeout: 120000
+    }
+  );
+  
+  return response.data.choices[0].message.content;
+}
+
+// --- OpenRouter : CORRECTION (agent, 50 req/jour gratuit) ---
+async function appelOpenRouterCorrection(messages, systemPrompt) {
+  if (!GLOBAL_KEYS.openrouter) throw new Error('Clé OpenRouter manquante');
+  
+  const response = await axios.post(
+    'https://openrouter.ai/api/v1/chat/completions',
+    {
+      model: 'qwen/qwen3-coder:free',
+      messages: [
+        { role: 'system', content: systemPrompt },
+        ...messages
+      ],
+      temperature: 0.3,
+      max_tokens: 8000
+    },
+    {
+      headers: {
+        'Authorization': `Bearer ${GLOBAL_KEYS.openrouter}`,
+        'Content-Type': 'application/json',
+        'HTTP-Referer': 'https://kenny.dev',
+        'X-Title': 'Kenny'
+      },
+      timeout: 120000
+    }
+  );
+  
+  return response.data.choices[0].message.content;
+}
+
+// --- Gemini : TESTS + CHAT (stable, gratuit) ---
+async function appelGeminiTest(messages, systemPrompt) {
+  if (!GLOBAL_KEYS.gemini) throw new Error('Clé Gemini manquante');
+
+  const contents = messages.map(m => ({
+    role: m.role === 'assistant' ? 'model' : 'user',
+    parts: [{ text: m.content }]
+  }));
+
+  const response = await axios.post(
+    GEMINI_URL(GLOBAL_KEYS.gemini),
+    {
+      systemInstruction: { parts: [{ text: systemPrompt }] },
+      contents: contents,
+      generationConfig: { temperature: 0.7, maxOutputTokens: 8000 }
+    },
+    {
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 180000
+    }
+  );
+
+    return response.data.candidates[0].content.parts[0].text;
+}
+  
+  
 app.post('/api/build/full', iaLimiter, async (req, res) => {
   const { firebase_uid, project_id, prompt } = req.body;
   if (!firebase_uid || !project_id || !prompt) return res.status(400).json({ error: 'Champs requis' });
@@ -783,8 +878,14 @@ app.post('/api/build/full', iaLimiter, async (req, res) => {
   try {
     envoyer('status', { message: '🧠 Analyse de la demande...' });
 
-    const systemPrompt = `Tu es un développeur senior expert. Tu vas générer une application COMPLÈTE (Full Build) avec frontend, backend, et base de données.
+buildsEnCours.set(project_id, {
+  active: true,
+  etape: 'analyse',
+  message: '🧠 Analyse de la demande...',
+  startedAt: new Date().toISOString()
+});
 
+const systemPrompt = `Tu es un développeur senior expert...
 RÈGLES ABSOLUES :
 1. STRUCTURE OBLIGATOIRE :
    - \`\`\`html:index.html\`\`\` → Le frontend principal
@@ -803,23 +904,44 @@ RÈGLES ABSOLUES :
 
     envoyer('status', { message: '🔨 Génération du code complet...' });
 
-    const response = await axios.post(
-      GEMINI_URL(keys.gemini),
-      {
-        systemInstruction: { parts: [{ text: systemPrompt }] },
-        contents: [{ role: 'user', parts: [{ text: prompt }] }],
-        generationConfig: { temperature: 0.7, maxOutputTokens: 8000 }
-      },
-      { headers: { 'Content-Type': 'application/json' }, timeout: 180000 }
-    );
+    let reponse;
+try {
+  envoyer('status', { message: '🤖 Génération via Groq...' });
+  reponse = await appelGroqCode(
+    [{ role: 'user', content: prompt }],
+    systemPrompt
+  );
+  envoyer('status', { message: '✅ Généré par Groq' });
+} catch (err) {
+  console.log('Groq échec, fallback Gemini:', err.message);
+  envoyer('status', { message: '⚠️ Groq échec, fallback Gemini...' });
+  const response = await axios.post(
+    GEMINI_URL(keys.gemini),
+    {
+      systemInstruction: { parts: [{ text: systemPrompt }] },
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      generationConfig: { temperature: 0.7, maxOutputTokens: 8000 }
+    },
+    { headers: { 'Content-Type': 'application/json' }, timeout: 180000 }
+  );
+  reponse = response.data.candidates[0].content.parts[0].text;
+  envoyer('status', { message: '✅ Généré par Gemini (fallback)' });
+}
 
-    if (closed) return res.end();
+if (closed) return res.end();
 
-    const reponse = response.data.candidates[0].content.parts[0].text;
-    const blocks = extraireBlocs(reponse);
+const blocks = extraireBlocs(reponse);
 
-    envoyer('status', { message: `📦 ${blocks.length} fichiers générés, sauvegarde...` });
-
+buildsEnCours.set(project_id, {
+  active: true,
+  etape: 'generation',
+  message: `📦 ${blocks.length} fichiers générés`,
+  startedAt: buildsEnCours.get(project_id)?.startedAt,
+  updatedAt: new Date().toISOString()
+});
+envoyer('status', { message: `📦 ${blocks.length} fichiers générés` });
+    
+    
     await withPg(async (client) => {
       await client.query('DELETE FROM files WHERE project_id = $1', [project_id]);
       for (const file of blocks) {
@@ -837,7 +959,14 @@ RÈGLES ABSOLUES :
     });
 
     if (ws?.github_repo) {
-      envoyer('status', { message: '🐙 Push sur GitHub...' });
+      buildsEnCours.set(project_id, {
+  active: true,
+  etape: 'push',
+  message: '🐙 Push sur GitHub...',
+  startedAt: buildsEnCours.get(project_id)?.startedAt,
+  updatedAt: new Date().toISOString()
+});
+envoyer('status', { message: '🐙 Push sur GitHub...' });
       const pushResults = await pushGitHubMultiDossiers(ws.github_repo, blocks, keys.github);
       const reussis = pushResults.filter(r => r.success).length;
       if (reussis === 0) {
@@ -848,7 +977,7 @@ RÈGLES ABSOLUES :
     }
 
     const finalUrl = ws?.render_service_url || ws?.github_repo || 'En cours...';
-    envoyer('done', { message: '✅ Full Build terminé !', url: finalUrl, files_count: blocks.length, tested: true });
+    envoyer('done', { message: '✅ Full Build terminé !', url: finalUrl, files_count: blocks.length, tested: false });
     
     if (!closed && !res.writableEnded) { res.write('event: end\ndata: {}\n\n'); res.end(); }
   } catch (error) {
@@ -957,34 +1086,19 @@ except Exception as e:
     }
 
     const runTest = await sb.commands.run(
-  `timeout 10 python3 ${mainFile.nom} > /tmp/run_out.log 2> /tmp/run_err.log; EXIT=$?; echo "---EXITCODE---"; echo $EXIT; echo "---STDOUT---"; cat /tmp/run_out.log; echo "---STDERR---"; cat /tmp/run_err.log`,
+  `timeout 10 python3 ${mainFile.nom} > /tmp/run_out.log 2> /tmp/run_err.log; EXIT=$?; echo "___KENNY_EXIT___:$EXIT"; echo "___KENNY_STDOUT_START___"; cat /tmp/run_out.log; echo "___KENNY_STDOUT_END___"; echo "___KENNY_STDERR_START___"; cat /tmp/run_err.log; echo "___KENNY_STDERR_END___"`,
   { timeoutMs: 15000 }
 );
 const runLog = (runTest.stdout || '') + '\n' + (runTest.stderr || '');
 
-// Parser robuste : tolère CRLF et espaces variés
-const exitMatch = runLog.match(/---EXITCODE---\s*[\r\n]+(\d+)/);
+// Parser avec marqueurs uniques
+const exitMatch = runLog.match(/___KENNY_EXIT___:(\d+)/);
 const scriptExit = exitMatch ? parseInt(exitMatch[1]) : -1;
 
-const stdoutMatch = runLog.match(/---STDOUT---\s*[\r\n]+([\s\S]*?)(?:[\r\n]+---STDERR---|$)/);
-const stderrMatch = runLog.match(/---STDERR---\s*[\r\n]+([\s\S]*?)$/);
+const stdoutMatch = runLog.match(/___KENNY_STDOUT_START___\n?([\s\S]*?)___KENNY_STDOUT_END___/);
+const stderrMatch = runLog.match(/___KENNY_STDERR_START___\n?([\s\S]*?)___KENNY_STDERR_END___/);
 const scriptStdout = stdoutMatch ? stdoutMatch[1].trim() : '';
 const scriptStderr = stderrMatch ? stderrMatch[1].trim() : '';
-
-// Si le parsing a échoué, essayer un fallback : considérer exit 0 si pas de marqueur d'erreur
-if (scriptExit === -1) {
-  // Fallback : si runLog contient "Hello" ou du texte sans "Traceback" ni "Error"
-  const hasError = /traceback|error|exception/i.test(runLog);
-  if (!hasError && runLog.length > 0) {
-    return {
-      success: true,
-      stdout: `✅ Script exécuté (parsing fallback).\n${runLog.substring(0, 500)}`,
-      stderr: '',
-      exitCode: 0,
-      sandbox: sb
-    };
-  }
-}
     if (scriptExit === 0 && !scriptStderr.includes('Traceback')) {
       return {
         success: true,
@@ -1075,38 +1189,42 @@ Investigue avec [CMD:], puis corrige avec [FIX].`
   for (let tour = 1; tour <= MAX_TOURS; tour++) {
     console.log(`🤖 Agent Gemini - tour ${tour}/${MAX_TOURS}`);
 
-    let response;
-    let tentativesGemini = 0;
-    const MAX_TENTATIVES_GEMINI = 3;
-    while (tentativesGemini < MAX_TENTATIVES_GEMINI) {
-      tentativesGemini++;
-      try {
-        response = await axios.post(
-          GEMINI_URL(keys.gemini),
-          {
-            systemInstruction: { parts: [{ text: agentSystemPrompt }] },
-            contents: conversationHistory,
-            generationConfig: { temperature: 0.3, maxOutputTokens: 8000 }
-          },
-          { headers: { 'Content-Type': 'application/json' }, timeout: 120000 }
-        );
-        break;
-      } catch (err) {
-        const status = err.response?.status;
-        if (status === 503 || status === 429) {
-          console.log(`⏳ Gemini ${status} au tour${tour} - retry ${tentativesGemini}/${MAX_TENTATIVES_GEMINI}...`);
-          if (tentativesGemini < MAX_TENTATIVES_GEMINI) {
-            await new Promise(r => setTimeout(r, 3000));
-            continue;
-          }
+  let reponse;
+try {
+  // Essayer OpenRouter d'abord
+  reponse = await appelOpenRouterCorrection(conversationHistory, agentSystemPrompt);
+  console.log('✅ Agent corrigé par OpenRouter');
+} catch (errOR) {
+  console.log('OpenRouter échec, fallback Gemini:', errOR.message);
+  // Fallback Gemini
+  let tentativesGemini = 0;
+  const MAX_TENTATIVES_GEMINI = 3;
+  while (tentativesGemini < MAX_TENTATIVES_GEMINI) {
+    tentativesGemini++;
+    try {
+      const response = await axios.post(
+        GEMINI_URL(keys.gemini),
+        {
+          systemInstruction: { parts: [{ text: agentSystemPrompt }] },
+          contents: conversationHistory,
+          generationConfig: { temperature: 0.3, maxOutputTokens: 8000 }
+        },
+        { headers: { 'Content-Type': 'application/json' }, timeout: 120000 }
+      );
+      reponse = response.data.candidates[0].content.parts[0].text;
+      break;
+    } catch (err) {
+      const status = err.response?.status;
+      if (status === 503 || status === 429) {
+        if (tentativesGemini < MAX_TENTATIVES_GEMINI) {
+          await new Promise(r => setTimeout(r, 3000));
+          continue;
         }
-        console.log(`❌ Agent Gemini erreur tour ${tour}:`, err.message);
-        return { success: false, error: `Gemini API : ${err.message}`, logsExecution };
       }
+      return { success: false, error: `Gemini API : ${err.message}`, logsExecution };
     }
-
-    const reponse = response.data.candidates[0].content.parts[0].text;
-
+  }
+}
     if (reponse.includes('[FIX]')) {
       const fixIndex = reponse.indexOf('[FIX]');
       const explication = reponse.substring(0, fixIndex).trim();
@@ -1247,9 +1365,16 @@ app.post('/api/build/python', iaLimiter, async (req, res) => {
 
   let sandboxFinale = null;
 
-  try {
-    envoyer('status', { message: '🧠 Génération du code Python...' });
+// Init suivi
+buildsEnCours.set(project_id, {
+  active: true,
+  etape: 'generation',
+  message: '🧠 Génération du code Python...',
+  startedAt: new Date().toISOString()
+});
 
+try {
+  envoyer('status', { message: '🧠 Génération du code Python...' });
     const systemPrompt = `Tu es un développeur expert en Python, Flask et data science.
 
 Génère une application COMPLÈTE et FONCTIONNELLE avec cette structure :
@@ -1267,21 +1392,31 @@ RÈGLES ABSOLUES :
 3. run.py lance l'app Flask sur port process.env.PORT || 3000
 4. Pas d'emojis dans le code`;
 
-    const response = await axios.post(
-      GEMINI_URL(keys.gemini),
-      {
-        systemInstruction: { parts: [{ text: systemPrompt }] },
-        contents: [{ role: 'user', parts: [{ text: prompt }] }],
-        generationConfig: { temperature: 0.7, maxOutputTokens: 8000 }
-      },
-      { headers: { 'Content-Type': 'application/json' }, timeout: 180000 }
-    );
-
-    if (closed) return res.end();
-
-    let blocks = extraireBlocs(response.data.candidates[0].content.parts[0].text);
-    envoyer('status', { message: `📦 ${blocks.length} fichiers générés` });
-
+    let reponse;
+try {
+  envoyer('status', { message: '🤖 Génération via Groq...' });
+  reponse = await appelGroqCode(
+    [{ role: 'user', content: prompt }],
+    systemPrompt
+  );
+  envoyer('status', { message: '✅ Généré par Groq' });
+} catch (err) {
+  console.log('Groq échec, fallback Gemini:', err.message);
+  envoyer('status', { message: '⚠️ Groq échec, fallback Gemini...' });
+  const response = await axios.post(
+    GEMINI_URL(keys.gemini),
+    {
+      systemInstruction: { parts: [{ text: systemPrompt }] },
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      generationConfig: { temperature: 0.7, maxOutputTokens: 8000 }
+    },
+    { headers: { 'Content-Type': 'application/json' }, timeout: 180000 }
+  );
+  reponse = response.data.candidates[0].content.parts[0].text;
+  envoyer('status', { message: '✅ Généré par Gemini (fallback)' });
+}
+    let blocks = extraireBlocs(reponse);
+envoyer('status', { message: `📦 ${blocks.length} fichiers générés` });
     await withPg(async (client) => {
       await client.query('DELETE FROM files WHERE project_id = $1', [project_id]);
       for (const file of blocks) {
@@ -1293,16 +1428,31 @@ RÈGLES ABSOLUES :
       }
     });
 
-    envoyer('status', { message: '🧪 Test du code dans la sandbox...' });
-    let testResult = await testerCodePython(blocks);
+    buildsEnCours.set(project_id, {
+  active: true,
+  etape: 'test',
+  message: '🧪 Test du code dans la sandbox...',
+  startedAt: buildsEnCours.get(project_id)?.startedAt,
+  updatedAt: new Date().toISOString()
+});
+envoyer('status', { message: '🧪 Test du code dans la sandbox...' }); 
+  let testResult = await testerCodePython(blocks);
     sandboxFinale = testResult.sandbox;
     let essais = 0;
     const MAX_ESSAIS = 3;
 
     while (!testResult.success && essais < MAX_ESSAIS && !closed) {
       essais++;
-      envoyer('status', { message: `🤖 Agent Gemini - tentative ${essais}/${MAX_ESSAIS}...` });
-
+      buildsEnCours.set(project_id, {
+  active: true,
+  etape: 'correction',
+  tentative: essais,
+  maxEssais: MAX_ESSAIS,
+  message: `🤖 Agent Gemini - tentative ${essais}/${MAX_ESSAIS}...`,
+  startedAt: buildsEnCours.get(project_id)?.startedAt,
+  updatedAt: new Date().toISOString()
+});
+envoyer('status', { message: `🤖 Agent Gemini - tentative ${essais}/${MAX_ESSAIS}...` });
       try {
         const agentResult = await corrigerAvecAgent(blocks, testResult, keys, testResult.sandbox);
 
@@ -1396,11 +1546,22 @@ RÈGLES ABSOLUES :
     console.error('Erreur build python:', error.message);
     envoyer('error', { message: error.response?.data?.error?.message || error.message });
     if (!closed && !res.writableEnded) { res.write('event: end\ndata: {}\n\n'); res.end(); }
-  } finally {
-    if (sandboxFinale && typeof sandboxFinale.kill === 'function') {
-      sandboxFinale.kill().catch(() => {});
-    }
+ } finally {
+  // Marquer le build comme terminé
+  const current = buildsEnCours.get(project_id) || {};
+  buildsEnCours.set(project_id, {
+    ...current,
+    active: false,
+    etape: 'termine',
+    endedAt: new Date().toISOString()
+  });
+  // Nettoyer après 5 minutes
+  setTimeout(() => buildsEnCours.delete(project_id), 5 * 60 * 1000);
+  
+  if (sandboxFinale && typeof sandboxFinale.kill === 'function') {
+    sandboxFinale.kill().catch(() => {});
   }
+}
 });
 
 app.post('/api/chat/stream', iaLimiter, async (req, res) => {
@@ -1631,6 +1792,85 @@ app.post('/api/terminal/close', async (req, res) => {
   await sandbox.fermerSandbox();
   res.json({ success: true });
 });
+  // ============================================
+// 📊 /api/build/status/:project_id — Progress du build
+// ============================================
+app.get('/api/build/status/:project_id', async (req, res) => {
+  const firebase_uid = req.headers['x-firebase-uid'];
+  if (!firebase_uid) {
+    return res.status(400).json({ error: 'Header x-firebase-uid requis' });
+  }
+  const owns = await verifierProprietaireProjet(firebase_uid, req.params.project_id);
+  if (!owns) {
+    return res.status(403).json({ error: 'Accès refusé' });
+  }
+  const status = buildsEnCours.get(req.params.project_id);
+  if (!status) {
+    return res.json({
+      active: false,
+      etape: 'inconnu',
+      message: 'Aucun build en cours pour ce projet'
+    });
+  }
+  res.json(status);
+});
+// ============================================
+// 📂 /api/projects/:project_id/files — Fichiers du projet
+// ============================================
+app.get('/api/projects/:project_id/files', async (req, res) => {
+  const firebase_uid = req.headers['x-firebase-uid'];
+  if (!firebase_uid) {
+    return res.status(400).json({ error: 'Header x-firebase-uid requis' });
+  }
+
+  const owns = await verifierProprietaireProjet(firebase_uid, req.params.project_id);
+  if (!owns) {
+    return res.status(403).json({ error: 'Accès refusé à ce projet' });
+  }
+
+  try {
+    const files = await withPg(async (client) => {
+      const r = await client.query(
+        'SELECT id, name, language, content, updated_at FROM files WHERE project_id = $1 ORDER BY name ASC',
+        [req.params.project_id]
+      );
+      return r.rows;
+    });
+    res.json({ success: true, files });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
+// 💬 /api/projects/:project_id/messages — Historique chat
+// ============================================
+app.get('/api/projects/:project_id/messages', async (req, res) => {
+  const firebase_uid = req.headers['x-firebase-uid'];
+  if (!firebase_uid) {
+    return res.status(400).json({ error: 'Header x-firebase-uid requis' });
+  }
+
+  const owns = await verifierProprietaireProjet(firebase_uid, req.params.project_id);
+  if (!owns) {
+    return res.status(403).json({ error: 'Accès refusé à ce projet' });
+  }
+
+  try {
+    const messages = await withPg(async (client) => {
+      const r = await client.query(
+        'SELECT id, role, content, created_at FROM conversation_memory WHERE project_id = $1 ORDER BY created_at ASC',
+        [req.params.project_id]
+      );
+      return r.rows;
+    });
+    res.json({ success: true, messages });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+  
 app.get('/api/quota/:firebase_uid', async (req, res) => {
   try {
     const data = await withPg(async (client) => {
@@ -1676,4 +1916,4 @@ process.on('SIGTERM', () => {
   console.log('SIGTERM reçu, arrêt propre...');
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 25000).unref();
-});
+}); 
