@@ -725,10 +725,12 @@ if (existing.rows.length > 0) {
 });
 
 function extraireBlocs(text) {
-  const regex = /```([a-zA-Z0-9_+\-]*)(?:[:\s]+([^\s\n`]+))?\s*\n([\s\S]*?)```/g;
   const blocs = [];
+
+  // Regex 1 : format standard ```langage:nom_fichier\n contenu ```
+  const regexStandard = /```([a-zA-Z0-9_+\-]*)(?:[:\s]+([^\s\n`]+))?\s*\n([\s\S]*?)```/g;
   let match;
-  while ((match = regex.exec(text)) !== null) {
+  while ((match = regexStandard.exec(text)) !== null) {
     const langage = (match[1] || 'code').toLowerCase();
     let nomFichier = match[2] ? match[2].trim() : null;
     const contenu = match[3].trim();
@@ -767,6 +769,80 @@ function extraireBlocs(text) {
 
     blocs.push({ langage, nom: finalNom, contenu });
   }
+
+  // [FALLBACK] Si regex standard ne trouve rien, essayer de détecter les fichiers par heuristique
+  if (blocs.length === 0) {
+    console.log('⚠️ extraireBlocs: aucun bloc avec regex standard, essai fallback heuristique');
+
+    // Chercher des patterns comme "**moteur/config.py**" ou "### moteur/config.py" suivis de code
+    const regexFallback = /(?:^|\n)(?:#{1,3}\s*|\*\*|`)?([a-zA-Z0-9_\/\-]+\.(py|html|js|css|json|txt|md|yml|yaml))(?:\*\*|`)?\s*\n+([\s\S]*?)(?=\n(?:#{1,3}\s*|\*\*|`)?[a-zA-Z0-9_\/\-]+\.(?:py|html|js|css|json|txt|md|yml|yaml)|$)/g;
+    let matchFb;
+    while ((matchFb = regexFallback.exec(text)) !== null) {
+      const nomFichier = matchFb[1].trim();
+      const ext = matchFb[2].toLowerCase();
+      const contenu = matchFb[3].trim();
+      if (!contenu || contenu.length < 5) continue;
+
+      const langage = ext === 'py' ? 'python'
+        : ext === 'js' ? 'javascript'
+        : ext === 'html' ? 'html'
+        : ext === 'css' ? 'css'
+        : ext === 'json' ? 'json'
+        : ext === 'md' ? 'markdown'
+        : ext === 'yml' || ext === 'yaml' ? 'yaml'
+        : 'txt';
+
+      let finalNom = nomFichier;
+      let counter = 1;
+      while (blocs.some(b => b.nom === finalNom)) {
+        const dot = nomFichier.lastIndexOf('.');
+        finalNom = dot > 0
+          ? `${nomFichier.substring(0, dot)}_${counter}${nomFichier.substring(dot)}`
+          : `${nomFichier}_${counter}`;
+        counter++;
+      }
+
+      blocs.push({ langage, nom: finalNom, contenu });
+    }
+
+    if (blocs.length > 0) {
+      console.log(`⚠️ Fallback heuristique: ${blocs.length} fichiers extraits`);
+    }
+  }
+
+  // [FALLBACK 2] Si toujours rien, chercher si c'est une réponse non structurée
+  if (blocs.length === 0) {
+    console.log('⚠️ Fallback 2: recherche de code Python brut sans nom de fichier');
+
+    // Chercher un bloc ```python ou ```py sans nom
+    const regexSansNom = /```(python|py)\s*\n([\s\S]*?)```/g;
+    let matchSN;
+    let count = 1;
+    while ((matchSN = regexSansNom.exec(text)) !== null) {
+      const contenu = matchSN[2].trim();
+      if (!contenu || contenu.length < 5) continue;
+
+      let nom = 'run.py';
+      if (contenu.includes('from flask') || contenu.includes('import flask')) {
+        nom = 'app.py';
+      } else if (!contenu.includes('if __name__ ==')) {
+        nom = `fichier${count}.py`;
+        count++;
+      }
+
+      if (blocs.some(b => b.nom === nom)) {
+        nom = nom.replace('.py', `_${count}.py`);
+        count++;
+      }
+
+      blocs.push({ langage: 'python', nom, contenu });
+    }
+
+    if (blocs.length > 0) {
+      console.log(`⚠️ Fallback 2: ${blocs.length} fichiers extraits sans nom`);
+    }
+  }
+
   return blocs;
 }
 
@@ -1368,22 +1444,64 @@ buildsEnCours.set(project_id, {
 
 try {
   envoyer('status', { message: '🧠 Génération du code Python...' });
-    const systemPrompt = `Tu es un développeur expert en Python, Flask et data science.
+            const systemPrompt = `Tu es un développeur expert en Python, Flask et data science.
 
-Génère une application COMPLÈTE et FONCTIONNELLE avec cette structure :
-- \`\`\`python:moteur/config.py\`\`\`
-- \`\`\`python:moteur/moteur.py\`\`\`
-- \`\`\`python:interface/serveur.py\`\`\`
-- \`\`\`html:templates/index.html\`\`\`
-- \`\`\`json:data/donnees.json\`\`\`
-- \`\`\`txt:requirements.txt\`\`\`
-- \`\`\`python:run.py\`\`\`
+Génère une application COMPLÈTE et FONCTIONNELLE avec cette structure OBLIGATOIRE :
+1. moteur/config.py
+2. moteur/moteur.py
+3. interface/serveur.py
+4. templates/index.html
+5. data/donnees.json
+6. requirements.txt
+7. run.py
 
-RÈGLES ABSOLUES :
-1. Code complet et fonctionnel, pas de "..." ni "TODO"
-2. requirements.txt avec toutes les dépendances
-3. run.py lance l'app Flask sur port process.env.PORT || 3000
-4. Pas d'emojis dans le code`;
+FORMAT DE SORTIE — RÈGLE ABSOLUE (sinon ton travail est REJETÉ) :
+
+Chaque fichier DOIT être dans un bloc avec 3 backticks, langue, deux-points, chemin, puis saut de ligne :
+
+\`\`\`python:moteur/config.py
+CONFIG = { ... }
+\`\`\`
+
+\`\`\`python:moteur/moteur.py
+def ma_fonction():
+    ...
+\`\`\`
+
+\`\`\`python:interface/serveur.py
+from flask import Flask
+...
+\`\`\`
+
+\`\`\`html:templates/index.html
+<!DOCTYPE html>
+...
+\`\`\`
+
+\`\`\`json:data/donnees.json
+{ "key": "value" }
+\`\`\`
+
+\`\`\`txt:requirements.txt
+flask>=2.0.0
+\`\`\`
+
+\`\`\`python:run.py
+from interface.serveur import app
+if __name__ == "__main__":
+    app.run()
+\`\`\`
+
+RÈGLES CRITIQUES :
+1. TOUJOURS 3 backticks AVANT et APRÈS chaque fichier
+2. TOUJOURS le nom du fichier juste après la langue, séparé par : (pas d'espace)
+3. Code complet et fonctionnel — JAMAIS de "..." ni "TODO"
+4. requirements.txt avec TOUTES les dépendances (flask, etc.)
+5. run.py doit lancer Flask sur process.env.PORT || 3000
+6. Pas d'emojis dans le code
+7. Ne réponds PAS avec des explications avant/après les blocs — direct les 7 blocs de code
+
+Si tu ne respectes pas exactement ce format, ton code sera rejeté.`;
 
     let reponse;
 try {
@@ -1409,6 +1527,17 @@ try {
   envoyer('status', { message: '✅ Généré par Gemini (fallback)' });
 }
     let blocks = extraireBlocs(reponse);
+
+    // [DEBUG] Voir la réponse brute de Groq si 0 fichiers
+    if (blocks.length === 0) {
+      envoyer('debug_groq', {
+        length: reponse.length,
+        nbBackticks: (reponse.match(/```/g) || []).length,
+        preview: reponse.substring(0, 800),
+        previewFin: reponse.substring(Math.max(0, reponse.length - 400))
+      });
+    }
+
 envoyer('status', { message: `📦 ${blocks.length} fichiers générés` });
     await withPg(async (client) => {
       await client.query('DELETE FROM files WHERE project_id = $1', [project_id]);
