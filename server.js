@@ -1429,121 +1429,139 @@ envoyer('status', { message: `📦 ${blocks.length} fichiers générés` });
   updatedAt: new Date().toISOString()
 });
 envoyer('status', { message: '🧪 Test du code dans la sandbox...' }); 
-let testResult = await testerCodePython(blocks);
-sandboxFinale = testResult.sandbox;
-let essais = 0;
-const MAX_ESSAIS = 3;
+  let testResult = await testerCodePython(blocks);
+  sandboxFinale = testResult.sandbox;
 
-while (!testResult.success && essais < MAX_ESSAIS && !closed) {
-  essais++;
-  buildsEnCours.set(project_id, {
-    active: true,
-    etape: 'correction',
-    tentative: essais,
-    maxEssais: MAX_ESSAIS,
-    message: `🔧 Correction ${essais}/${MAX_ESSAIS} — fichier : ${testResult.fichierCoupable || '?'}`,
-    startedAt: buildsEnCours.get(project_id)?.startedAt,
-    updatedAt: new Date().toISOString()
+  envoyer('test_result', {
+    tour: 0,
+    success: testResult.success,
+    exitCode: testResult.exitCode || null,
+    fichierCoupable: testResult.fichierCoupable || null,
+    stdout: (testResult.stdout || '').substring(0, 800),
+    stderr: (testResult.stderr || '').substring(0, 800)
   });
-  envoyer('status', { message: `🔧 Correction ${essais}/${MAX_ESSAIS} — fichier : ${testResult.fichierCoupable || '?'}` });
 
-  try {
-    const fichierCoupableNom = testResult.fichierCoupable
-      || (blocks.find(b => b.nom === 'run.py')?.nom)
-      || (blocks.find(b => b.nom === 'main.py')?.nom)
-      || (blocks.find(b => b.nom === 'app.py')?.nom);
+  let essais = 0;
+  const MAX_ESSAIS = 3;
 
-    const fichierCible = blocks.find(b => b.nom === fichierCoupableNom);
+  while (!testResult.success && essais < MAX_ESSAIS && !closed) {
+    essais++;
+    buildsEnCours.set(project_id, {
+      active: true,
+      etape: 'correction',
+      tentative: essais,
+      maxEssais: MAX_ESSAIS,
+      message: `🔧 Correction ${essais}/${MAX_ESSAIS} — fichier : ${testResult.fichierCoupable || '?'}`,
+      startedAt: buildsEnCours.get(project_id)?.startedAt,
+      updatedAt: new Date().toISOString()
+    });
+    envoyer('status', { message: `🔧 Correction ${essais}/${MAX_ESSAIS} — fichier : ${testResult.fichierCoupable || '?'}` });
 
-    if (!fichierCible) {
-      envoyer('message', { role: 'ia', content: `⚠️ Fichier "${fichierCoupableNom}" introuvable, abandon.` });
-      break;
-    }
+    try {
+      const fichierCoupableNom = testResult.fichierCoupable
+        || (blocks.find(b => b.nom === 'run.py')?.nom)
+        || (blocks.find(b => b.nom === 'main.py')?.nom)
+        || (blocks.find(b => b.nom === 'app.py')?.nom);
 
-    const correctionResult = await corrigerFichierCible(
-      prompt,
-      fichierCible,
-      testResult.stderr || testResult.stdout,
-      keys
-    );
+      const fichierCible = blocks.find(b => b.nom === fichierCoupableNom);
 
-    if (!correctionResult.success) {
-      envoyer('message', { role: 'ia', content: `⚠️ Correction impossible au tour ${essais} : ${correctionResult.error || ''}` });
-      break;
-    }
-
-    if (correctionResult.explication) {
-      envoyer('message', {
-        role: 'ia',
-        content: `Tentative ${essais}/${MAX_ESSAIS} (${correctionResult.provider}) :\n${correctionResult.explication.substring(0, 800)}`
-      });
-    }
-
-    blocks = blocks.map(b => b.nom === fichierCible.nom ? correctionResult.fichierCorrige : b);
-
-    await withPg(async (client) => {
-      await client.query('DELETE FROM files WHERE project_id = $1', [project_id]);
-      for (const file of blocks) {
-        await client.query(
-          'INSERT INTO files (project_id, name, language, content) VALUES ($1, $2, $3, $4)',
-          [project_id, file.nom, file.langage, file.contenu]
-        );
-        envoyer('file', { name: file.nom, language: file.langage, content: file.contenu });
+      if (!fichierCible) {
+        envoyer('message', { role: 'ia', content: `⚠️ Fichier "${fichierCoupableNom}" introuvable, abandon.` });
+        break;
       }
-    });
 
-    if (testResult.sandbox && typeof testResult.sandbox.kill === 'function') {
-      await testResult.sandbox.kill().catch(() => {});
+      const correctionResult = await corrigerFichierCible(
+        prompt,
+        fichierCible,
+        testResult.stderr || testResult.stdout,
+        keys
+      );
+
+      if (!correctionResult.success) {
+        envoyer('message', { role: 'ia', content: `⚠️ Correction impossible au tour ${essais} : ${correctionResult.error || ''}` });
+        break;
+      }
+
+      if (correctionResult.explication) {
+        envoyer('message', {
+          role: 'ia',
+          content: `Tentative ${essais}/${MAX_ESSAIS} (${correctionResult.provider}) :\n${correctionResult.explication.substring(0, 800)}`
+        });
+      }
+
+      blocks = blocks.map(b => b.nom === fichierCible.nom ? correctionResult.fichierCorrige : b);
+
+      await withPg(async (client) => {
+        await client.query('DELETE FROM files WHERE project_id = $1', [project_id]);
+        for (const file of blocks) {
+          await client.query(
+            'INSERT INTO files (project_id, name, language, content) VALUES ($1, $2, $3, $4)',
+            [project_id, file.nom, file.langage, file.contenu]
+          );
+          envoyer('file', { name: file.nom, language: file.langage, content: file.contenu });
+        }
+      });
+
+      if (testResult.sandbox && typeof testResult.sandbox.kill === 'function') {
+        await testResult.sandbox.kill().catch(() => {});
+      }
+
+      testResult = await testerCodePython(blocks);
+      sandboxFinale = testResult.sandbox;
+
+      envoyer('test_result', {
+        tour: essais,
+        success: testResult.success,
+        exitCode: testResult.exitCode || null,
+        fichierCoupable: testResult.fichierCoupable || null,
+        stdout: (testResult.stdout || '').substring(0, 800),
+        stderr: (testResult.stderr || '').substring(0, 800)
+      });
+    } catch (e) {
+      console.log('Erreur correction:', e.message);
+      envoyer('message', { role: 'ia', content: `Erreur correction : ${e.message}` });
+      break;
     }
-
-    testResult = await testerCodePython(blocks);
-    sandboxFinale = testResult.sandbox;
-  } catch (e) {
-    console.log('Erreur correction:', e.message);
-    envoyer('message', { role: 'ia', content: `Erreur correction : ${e.message}` });
-    break;
   }
-}
 
-if (testResult.success) {
-  envoyer('message', {
-    role: 'ia',
-    content: `✅ Code testé avec succès${essais > 0 ? ` (après ${essais} correction${essais > 1 ? 's' : ''})` : ''} !\n\nSortie :\n\`\`\`\n${testResult.stdout.substring(0, 500)}\n\`\`\``
-  });
-} else {
-  envoyer('message', {
-    role: 'ia',
-    content: `⚠️ Le code a été généré mais n'a pas pu être corrigé après ${essais} tentative(s).`
-  });
-}
-
-    const ws = await withPg(async (client) => {
-      const r = await client.query('SELECT * FROM workspaces WHERE project_id = $1', [project_id]);
-      return r.rows[0] || null;
+  if (testResult.success) {
+    envoyer('message', {
+      role: 'ia',
+      content: `✅ Code testé avec succès${essais > 0 ? ` (après ${essais} correction${essais > 1 ? 's' : ''})` : ''} !\n\nSortie :\n\`\`\`\n${testResult.stdout.substring(0, 500)}\n\`\`\``
     });
-
-    if (ws?.github_repo) {
-      envoyer('status', { message: '🐙 Push sur GitHub...' });
-      const pushResults = await pushGitHubMultiDossiers(ws.github_repo, blocks, keys.github);
-      const reussis = pushResults.filter(r => r.success).length;
-      envoyer('status', { message: `✅ ${reussis}/${pushResults.length} fichiers pushés sur GitHub` });
-    }
-
-    const finalUrl = ws?.render_service_url || ws?.github_repo || 'En cours...';
-    envoyer('done', {
-      message: '✅ Build Python terminé !',
-      url: finalUrl,
-      files_count: blocks.length,
-      tested: testResult.success
+  } else {
+    envoyer('message', {
+      role: 'ia',
+      content: `⚠️ Le code a été généré mais n'a pas pu être corrigé après ${essais} tentative(s).`
     });
+  }
 
-    if (!closed && !res.writableEnded) { res.write('event: end\ndata: {}\n\n'); res.end(); }
-  } catch (error) {
-    console.error('Erreur build python:', error.message);
-    envoyer('error', { message: error.response?.data?.error?.message || error.message });
-    if (!closed && !res.writableEnded) { res.write('event: end\ndata: {}\n\n'); res.end(); }
- } finally {
-  // Marquer le build comme terminé
+  const ws = await withPg(async (client) => {
+    const r = await client.query('SELECT * FROM workspaces WHERE project_id = $1', [project_id]);
+    return r.rows[0] || null;
+  });
+
+  if (ws?.github_repo) {
+    envoyer('status', { message: '🐙 Push sur GitHub...' });
+    const pushResults = await pushGitHubMultiDossiers(ws.github_repo, blocks, keys.github);
+    const reussis = pushResults.filter(r => r.success).length;
+    envoyer('status', { message: `✅ ${reussis}/${pushResults.length} fichiers pushés sur GitHub` });
+  }
+
+  const finalUrl = ws?.render_service_url || ws?.github_repo || 'En cours...';
+  envoyer('done', {
+    message: '✅ Build Python terminé !',
+    url: finalUrl,
+    files_count: blocks.length,
+    tested: testResult.success
+  });
+
+  if (!closed && !res.writableEnded) { res.write('event: end\ndata: {}\n\n'); res.end(); }
+} catch (error) {
+  console.error('Erreur build python:', error.message);
+  envoyer('error', { message: error.response?.data?.error?.message || error.message });
+  if (!closed && !res.writableEnded) { res.write('event: end\ndata: {}\n\n'); res.end(); }
+} finally {
   const current = buildsEnCours.get(project_id) || {};
   buildsEnCours.set(project_id, {
     ...current,
@@ -1551,15 +1569,13 @@ if (testResult.success) {
     etape: 'termine',
     endedAt: new Date().toISOString()
   });
-  // Nettoyer après 5 minutes
   setTimeout(() => buildsEnCours.delete(project_id), 5 * 60 * 1000);
-  
+
   if (sandboxFinale && typeof sandboxFinale.kill === 'function') {
     sandboxFinale.kill().catch(() => {});
   }
 }
 });
-
 app.post('/api/chat/stream', iaLimiter, async (req, res) => {
   const { message, history, firebase_uid, project_id, terminal_history } = req.body;
 
@@ -1912,4 +1928,4 @@ process.on('SIGTERM', () => {
   console.log('SIGTERM reçu, arrêt propre...');
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 25000).unref();
-});
+});   
