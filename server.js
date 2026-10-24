@@ -9,9 +9,15 @@ const antivirus = require('./agents/antivirus');
 const sandbox = require('./agents/sandbox');
 
 // [NEW] Garde-fous process
-process.on('unhandledRejection', (err) => console.error('🔴 UnhandledRejection:', err));
-process.on('uncaughtException', (err) => console.error('🔴 UncaughtException:', err));
-
+// [FIX #23] Après une exception non gérée, l'état est incohérent → on meurt proprement
+process.on('unhandledRejection', (err) => {
+  console.error('🔴 UnhandledRejection:', err);
+  process.exit(1);
+});
+process.on('uncaughtException', (err) => {
+  console.error('🔴 UncaughtException:', err);
+  process.exit(1);
+});
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -21,10 +27,14 @@ const MAX_HISTORY = 30;
 const MAX_TERMINAL_HISTORY = 10;
 
 // [FIX #18] CORS restreint
-const ALLOWED_ORIGINS = (process.env.CORS_ORIGINS || '*').split(',').map(s => s.trim());
+// [FIX #5] credentials: false si wildcard (évite fuite CSRF)
+const CORS_ORIGINS_RAW = (process.env.CORS_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
+const CORS_WILDCARD = CORS_ORIGINS_RAW.length === 0 || CORS_ORIGINS_RAW.includes('*');
+const ALLOWED_ORIGINS = CORS_WILDCARD ? ['*'] : CORS_ORIGINS_RAW;
+
 app.use(cors({
-  origin: ALLOWED_ORIGINS.includes('*') ? true : ALLOWED_ORIGINS,
-  credentials: true
+  origin: CORS_WILDCARD ? true : ALLOWED_ORIGINS,
+  credentials: !CORS_WILDCARD  // pas de credentials si wildcard
 }));
 app.use(express.json({ limit: '2mb' }));
 
@@ -976,7 +986,7 @@ envoyer('status', { message: '🐙 Push sur GitHub...' });
       }
     }
 
-    const finalUrl = ws?.render_service_url || ws?.github_repo || 'En cours...';
+        const finalUrl = ws?.render_service_url || ws?.github_repo || 'En cours...';
     envoyer('done', { message: '✅ Full Build terminé !', url: finalUrl, files_count: blocks.length, tested: false });
     
     if (!closed && !res.writableEnded) { res.write('event: end\ndata: {}\n\n'); res.end(); }
@@ -984,9 +994,18 @@ envoyer('status', { message: '🐙 Push sur GitHub...' });
     console.error('Erreur full build:', error.message);
     envoyer('error', { message: error.response?.data?.error?.message || error.message });
     if (!closed && !res.writableEnded) { res.write('event: end\ndata: {}\n\n'); res.end(); }
+  } finally {
+    // [FIX #13] Marquer le build comme terminé + nettoyer après 5 min
+    const current = buildsEnCours.get(project_id) || {};
+    buildsEnCours.set(project_id, {
+      ...current,
+      active: false,
+      etape: 'termine',
+      endedAt: new Date().toISOString()
+    });
+    setTimeout(() => buildsEnCours.delete(project_id), 5 * 60 * 1000);
   }
 });
-
 async function uploaderDansSandbox(blocks) {
   const sb = await sandbox.creerSandbox();
   for (const block of blocks) {
@@ -1072,19 +1091,27 @@ except Exception as e:
     const importResult = await sb.commands.run('python3 _kenny_import_test.py 2>&1', { timeoutMs: 30000 });
     const importLog = (importResult.stdout || '') + '\n' + (importResult.stderr || '');
 
-    if (importLog.includes('IMPORT_ERROR_START')) {
-      const start = importLog.indexOf('IMPORT_ERROR_START') + 'IMPORT_ERROR_START'.length;
-      const end = importLog.indexOf('IMPORT_ERROR_END');
-      const traceback = importLog.substring(start, end > 0 ? end : undefined).trim();
-      return {
-        success: false,
-        stdout: importLog.substring(0, 3000),
-        stderr: `ERREUR D'IMPORT DANS ${mainFile.nom} :\n\`\`\`\n${tailTruncate(traceback, 2000)}\n\`\`\``,
-        exitCode: 1,
-        sandbox: sb
-      };
-    }
+ if (importLog.includes('IMPORT_ERROR_START')) {
+  const start = importLog.indexOf('IMPORT_ERROR_START') + 'IMPORT_ERROR_START'.length;
+  const end = importLog.indexOf('IMPORT_ERROR_END');
+  const traceback = importLog.substring(start, end > 0 ? end : undefined).trim();
 
+  // Détecter le fichier coupable
+  let fichierCoupable = mainFile.nom;
+  const importMatch = traceback.match(/File "[^"]*\/([^\/"]+\.py)"/);
+  if (importMatch) {
+    fichierCoupable = importMatch[1];
+  }
+
+  return {
+    success: false,
+    stdout: importLog.substring(0, 3000),
+    stderr: `ERREUR D'IMPORT DANS ${fichierCoupable} :\n\`\`\`\n${tailTruncate(traceback, 2000)}\n\`\`\``,
+    exitCode: 1,
+    fichierCoupable,
+    sandbox: sb
+  };
+}
     const runTest = await sb.commands.run(
   `timeout 10 python3 ${mainFile.nom} > /tmp/run_out.log 2> /tmp/run_err.log; EXIT=$?; echo "___KENNY_EXIT___:$EXIT"; echo "___KENNY_STDOUT_START___"; cat /tmp/run_out.log; echo "___KENNY_STDOUT_END___"; echo "___KENNY_STDERR_START___"; cat /tmp/run_err.log; echo "___KENNY_STDERR_END___"`,
   { timeoutMs: 15000 }
@@ -1125,178 +1152,144 @@ const scriptStderr = stderrMatch ? stderrMatch[1].trim() : '';
       };
     }
 
-    return {
-      success: false,
-      stdout: runLog.substring(0, 3000),
-      stderr: `CRASH DE ${mainFile.nom} (exit${scriptExit}) :\n\`\`\`\n${tailTruncate(scriptStderr, 2500)}\n\`\`\``,
-      exitCode: scriptExit, sandbox: sb
-    };
+ // Détecter le fichier coupable dans le traceback du run
+let fichierCoupable = mainFile.nom;
+const runTraceMatch = (scriptStderr || '').match(/File "[^"]*\/([^\/"]+\.py)"/);
+if (runTraceMatch) {
+  fichierCoupable = runTraceMatch[1];
+}
+
+return {
+  success: false,
+  stdout: runLog.substring(0, 3000),
+  stderr: `ERREUR D'EXÉCUTION DANS ${fichierCoupable} :\n\`\`\`\n${tailTruncate(scriptStderr, 2000)}\n\`\`\``,
+  exitCode: scriptExit,
+  fichierCoupable,
+  sandbox: sb
+};
   } catch (e) {
     if (sb && typeof sb.kill === 'function') await sb.kill().catch(() => {});
     return { success: false, stderr: `Erreur interne sandbox :\n${e.message}`, stdout: '', exitCode: 1 };
   }
 }
 
-async function corrigerAvecAgent(blocks, testResult, keys, sandboxInstance) {
-  const agentSystemPrompt = `Tu es un développeur senior qui CORRIGE un projet Python cassé.
+// ============================================
+// 🔧 CORRECTION CIBLÉE (une seule passe, contexte préservé)
+// ============================================
+async function corrigerFichierCible(promptOriginal, fichier, erreur, keys) {
+  const systemPrompt = `Tu es un développeur senior qui CORRIGE UN SEUL FICHIER Python.
 
-Tu as accès à un TERMINAL LINUX via des balises [CMD: commande].
+CONTEXTE DU PROJET (demande originale de l'utilisateur) :
+"""${promptOriginal}"""
 
-DÉROULEMENT :
-1. Tu reçois le projet + l'erreur détectée
-2. Tu EXÉCUTES des commandes pour INVESTIGUER
-3. Tu observes les résultats
-4. Tu continues jusqu'à comprendre la cause EXACTE
-5. Puis tu renvoies [FIX] + les fichiers corrigés
+FICHIER À CORRIGER : ${fichier.nom}
 
-COMMANDES AUTORISÉES : ls, cat, head, tail, find, tree, pwd, which, stat, wc, grep, python3 -c, py_compile, pip list, pip show, pip freeze, timeout 30 python3 run.py 2>&1, pip install
+CONTENU ACTUEL :
+\`\`\`${fichier.langage}
+${fichier.contenu}
+\`\`\`
 
-COMMANDES INTERDITES : rm, sudo, chmod, curl, wget, apt-get, eval, exec, > /dev/, ../
+ERREUR DÉTECTÉE :
+\`\`\`
+${erreur}
+\`\`\`
 
-FORMAT :
-- [CMD: <commande>] pour exécuter
-- [FIX] + explication FR + fichiers corrigés pour corriger
+TA MISSION :
+1. Analyse l'erreur (1-2 phrases max)
+2. Corrige UNIQUEMENT ce fichier
+3. Renvoie le contenu COMPLET corrigé du fichier (pas un diff, le fichier entier)
 
-RÈGLES :
-- N'invente JAMAIS une erreur. Base-toi UNIQUEMENT sur les logs réels.
-- Vérifie chaque hypothèse avant de corriger.
-- Format fichiers : \`\`\`python:nom_fichier
-- Ne renomme PAS les fichiers.
+FORMAT DE SORTIE OBLIGATOIRE :
+D'abord l'explication, puis :
 
-MAX 5 TOURS.`;
+\`\`\`${fichier.langage}:${fichier.nom}
+<contenu complet corrigé>
+\`\`\`
 
-  const conversationHistory = [{
-    role: 'user',
-    parts: [{
-      text: `Voici le projet Python qui plante.
+RÈGLES STRICTES :
+- Ne renvoie QUE ce fichier (pas les autres)
+- Ne renomme PAS le fichier
+- Ne change PAS la structure du projet
+- Garde le style de code existant
+- Si l'erreur n'est pas dans ce fichier, renvoie le fichier tel quel`;
 
-=== FICHIERS ===
-${blocks.map(b => `\n--- ${b.nom} ---\n${b.contenu}`).join('\n')}
-
-=== ERREUR DÉTECTÉE ===
-${testResult.stderr}
-
-=== SORTIE ===
-${(testResult.stdout || '').substring(0, 1000)}
-
-Investigue avec [CMD:], puis corrige avec [FIX].`
-    }]
-  }];
-
-  const logsExecution = [];
-  const MAX_TOURS = 5;
-
-  for (let tour = 1; tour <= MAX_TOURS; tour++) {
-    console.log(`🤖 Agent Gemini - tour ${tour}/${MAX_TOURS}`);
-
-  let reponse;
-try {
-  // Essayer OpenRouter d'abord
-  reponse = await appelOpenRouterCorrection(conversationHistory, agentSystemPrompt);
-  console.log('✅ Agent corrigé par OpenRouter');
-} catch (errOR) {
-  console.log('OpenRouter échec, fallback Gemini:', errOR.message);
-  // Fallback Gemini
-  let tentativesGemini = 0;
-  const MAX_TENTATIVES_GEMINI = 3;
-  while (tentativesGemini < MAX_TENTATIVES_GEMINI) {
-    tentativesGemini++;
-    try {
-      const response = await axios.post(
-        GEMINI_URL(keys.gemini),
-        {
-          systemInstruction: { parts: [{ text: agentSystemPrompt }] },
-          contents: conversationHistory,
-          generationConfig: { temperature: 0.3, maxOutputTokens: 8000 }
+  // Essai 1 : OpenRouter
+  try {
+    console.log(`🔧 Correction OpenRouter pour ${fichier.nom}...`);
+    const response = await axios.post(
+      'https://openrouter.ai/api/v1/chat/completions',
+      {
+        model: 'poolside/laguna-s-2.1:free',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: `Corrige ${fichier.nom}` }
+        ],
+        temperature: 0.2,
+        max_tokens: 4000
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${keys.openrouter}`,
+          'Content-Type': 'application/json',
+          'HTTP-Referer': 'https://kenny.dev',
+          'X-Title': 'Kenny'
         },
-        { headers: { 'Content-Type': 'application/json' }, timeout: 120000 }
-      );
-      reponse = response.data.candidates[0].content.parts[0].text;
-      break;
-    } catch (err) {
-      const status = err.response?.status;
-      if (status === 503 || status === 429) {
-        if (tentativesGemini < MAX_TENTATIVES_GEMINI) {
-          await new Promise(r => setTimeout(r, 3000));
-          continue;
-        }
+        timeout: 180000
       }
-      return { success: false, error: `Gemini API : ${err.message}`, logsExecution };
+    );
+
+    const reponse = response.data.choices[0].message.content;
+    const blocs = extraireBlocs(reponse);
+    const fichierCorrige = blocs.find(b => b.nom === fichier.nom);
+
+    if (fichierCorrige) {
+      console.log(`✅ ${fichier.nom} corrigé par OpenRouter`);
+      return {
+        success: true,
+        fichierCorrige: { ...fichier, contenu: fichierCorrige.contenu },
+        explication: reponse.replace(/```[\s\S]*?```/g, '').trim(),
+        provider: 'openrouter'
+      };
     }
+    throw new Error('OpenRouter n\'a pas renvoyé le fichier');
+  } catch (err) {
+    console.log(`❌ OpenRouter échec pour ${fichier.nom}:`, err.message);
   }
-}
-    if (reponse.includes('[FIX]')) {
-      const fixIndex = reponse.indexOf('[FIX]');
-      const explication = reponse.substring(0, fixIndex).trim();
-      const blocFix = reponse.substring(fixIndex);
-      const blocksCorriges = extraireBlocs(blocFix);
 
-      if (blocksCorriges.length === 0) {
-        conversationHistory.push({ role: 'model', parts: [{ text: reponse }] });
-        conversationHistory.push({ role: 'user', parts: [{ text: 'Tu as dit [FIX] mais tu n\'as envoyé aucun fichier. Envoie TOUS les fichiers corrigés au format ```python:nom_fichier' }] });
-        continue;
-      }
+  // Essai 2 : Gemini
+  try {
+    console.log(`🔧 Fallback Gemini pour ${fichier.nom}...`);
+    const response = await axios.post(
+      GEMINI_URL(keys.gemini),
+      {
+        systemInstruction: { parts: [{ text: systemPrompt }] },
+        contents: [{ role: 'user', parts: [{ text: `Corrige ${fichier.nom}` }] }],
+        generationConfig: { temperature: 0.2, maxOutputTokens: 8000 }
+      },
+      { headers: { 'Content-Type': 'application/json' }, timeout: 180000 }
+    );
 
-      return { success: true, explication, blocks: blocksCorriges, logsExecution, tours: tour };
+    const reponse = response.data.candidates[0].content.parts[0].text;
+    const blocs = extraireBlocs(reponse);
+    const fichierCorrige = blocs.find(b => b.nom === fichier.nom);
+
+    if (fichierCorrige) {
+      console.log(`✅ ${fichier.nom} corrigé par Gemini`);
+      return {
+        success: true,
+        fichierCorrige: { ...fichier, contenu: fichierCorrige.contenu },
+        explication: reponse.replace(/```[\s\S]*?```/g, '').trim(),
+        provider: 'gemini'
+      };
     }
-
-    const cmdRegex = /\[CMD:\s*(.+?)\]/g;
-    const commandes = [];
-    let match;
-    while ((match = cmdRegex.exec(reponse)) !== null) {
-      commandes.push(match[1].trim());
-    }
-
-    if (commandes.length === 0) {
-      conversationHistory.push({ role: 'model', parts: [{ text: reponse }] });
-      conversationHistory.push({ role: 'user', parts: [{ text: 'Tu dois envoyer soit [CMD: commande], soit [FIX]. Recommence.' }] });
-      continue;
-    }
-
-    const resultats = [];
-    for (const cmd of commandes) {
-      const verif = verifierCommandeAgent(cmd);
-      if (!verif.allowed) {
-        console.log(`  🚫 [CMD bloquée] ${cmd} →${verif.reason}`);
-        resultats.push({ cmd, success: false, blocked: true, stdout: '', stderr: `❌ COMMANDE BLOQUÉE : ${verif.reason}`, exitCode: 1 });
-        logsExecution.push({ tour, cmd, blocked: true, reason: verif.reason });
-        continue;
-      }
-
-      console.log(`  💻 [CMD] ${cmd}`);
-      try {
-        const result = await sandboxInstance.commands.run(cmd, { timeoutMs: 45000 });
-        const r = {
-          cmd,
-          success: result.exitCode === 0,
-          stdout: (result.stdout || '').substring(0, 3000),
-          stderr: tailTruncate(result.stderr || '', 1500),
-          exitCode: result.exitCode
-        };
-        resultats.push(r);
-        logsExecution.push({ tour, ...r });
-      } catch (err) {
-        // [FIX] Erreur correctement fermée ici
-        resultats.push({ cmd, success: false, stdout: '', stderr: `Erreur exécution : ${err.message}`, exitCode: 1 });
-        logsExecution.push({ tour, cmd, success: false, error: err.message });
-      }
-    }
-
-    conversationHistory.push({ role: 'model', parts: [{ text: reponse }] });
-    conversationHistory.push({
-      role: 'user',
-      parts: [{
-        text: `RÉSULTATS :\n\n${resultats.map(r =>
-          `[CMD: ${r.cmd}]${r.blocked ? ' (BLOQUÉE)' : ''}\nEXIT: ${r.exitCode}\n--- stdout ---\n${r.stdout || '(vide)'}\n--- stderr ---\n${r.stderr || '(vide)'}`
-        ).join('\n\n')}\n\nContinue l'investigation OU renvoie [FIX] avec les fichiers corrigés.`
-      }]
-    });
+    throw new Error('Gemini n\'a pas renvoyé le fichier');
+  } catch (err) {
+    console.log(`❌ Gemini échec pour ${fichier.nom}:`, err.message);
   }
 
   return {
     success: false,
-    error: 'Agent Gemini n\'a pas trouvé de correction après 5 tours',
-    logsExecution
+    error: 'Ni OpenRouter ni Gemini n\'ont pu corriger'
   };
 }
 
@@ -1359,9 +1352,9 @@ app.post('/api/build/python', iaLimiter, async (req, res) => {
   let closed = false;
   req.on('close', () => { closed = true; });
   const envoyer = (type, data) => {
-    if (closed || res.writableEnded) return;
-    try { res.write(`event: ${type}\ndata:${JSON.stringify(data)}\n\n`); } catch (e) {}
-  };
+  if (closed || res.writableEnded) return;
+  try { res.write(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`); } catch (e) {}
+};
 
   let sandboxFinale = null;
 
@@ -1436,90 +1429,93 @@ envoyer('status', { message: `📦 ${blocks.length} fichiers générés` });
   updatedAt: new Date().toISOString()
 });
 envoyer('status', { message: '🧪 Test du code dans la sandbox...' }); 
-  let testResult = await testerCodePython(blocks);
-    sandboxFinale = testResult.sandbox;
-    let essais = 0;
-    const MAX_ESSAIS = 3;
+let testResult = await testerCodePython(blocks);
+sandboxFinale = testResult.sandbox;
+let essais = 0;
+const MAX_ESSAIS = 3;
 
-    while (!testResult.success && essais < MAX_ESSAIS && !closed) {
-      essais++;
-      buildsEnCours.set(project_id, {
-  active: true,
-  etape: 'correction',
-  tentative: essais,
-  maxEssais: MAX_ESSAIS,
-  message: `🤖 Agent Gemini - tentative ${essais}/${MAX_ESSAIS}...`,
-  startedAt: buildsEnCours.get(project_id)?.startedAt,
-  updatedAt: new Date().toISOString()
-});
-envoyer('status', { message: `🤖 Agent Gemini - tentative ${essais}/${MAX_ESSAIS}...` });
-      try {
-        const agentResult = await corrigerAvecAgent(blocks, testResult, keys, testResult.sandbox);
+while (!testResult.success && essais < MAX_ESSAIS && !closed) {
+  essais++;
+  buildsEnCours.set(project_id, {
+    active: true,
+    etape: 'correction',
+    tentative: essais,
+    maxEssais: MAX_ESSAIS,
+    message: `🔧 Correction ${essais}/${MAX_ESSAIS} — fichier : ${testResult.fichierCoupable || '?'}`,
+    startedAt: buildsEnCours.get(project_id)?.startedAt,
+    updatedAt: new Date().toISOString()
+  });
+  envoyer('status', { message: `🔧 Correction ${essais}/${MAX_ESSAIS} — fichier : ${testResult.fichierCoupable || '?'}` });
 
-        for (const log of (agentResult.logsExecution || [])) {
-          envoyer('agent_log', {
-            tour: log.tour, cmd: log.cmd, success: log.success,
-            blocked: log.blocked || false, stdout: log.stdout || '',
-            stderr: log.stderr || '', exitCode: log.exitCode,
-            reason: log.reason || null
-          });
-        }
+  try {
+    const fichierCoupableNom = testResult.fichierCoupable
+      || (blocks.find(b => b.nom === 'run.py')?.nom)
+      || (blocks.find(b => b.nom === 'main.py')?.nom)
+      || (blocks.find(b => b.nom === 'app.py')?.nom);
 
-        if (!agentResult.success) {
-          envoyer('message', {
-            role: 'ia',
-            content: `⚠️ Agent Gemini n'a pas trouvé de correction au tour ${essais}.${agentResult.error || ''}`
-          });
-          break;
-        }
+    const fichierCible = blocks.find(b => b.nom === fichierCoupableNom);
 
-        if (agentResult.explication) {
-          envoyer('message', {
-            role: 'ia',
-            content: `Tentative ${essais}/${MAX_ESSAIS} :${agentResult.explication.substring(0, 800)}`
-          });
-        }
+    if (!fichierCible) {
+      envoyer('message', { role: 'ia', content: `⚠️ Fichier "${fichierCoupableNom}" introuvable, abandon.` });
+      break;
+    }
 
-        blocks = agentResult.blocks;
+    const correctionResult = await corrigerFichierCible(
+      prompt,
+      fichierCible,
+      testResult.stderr || testResult.stdout,
+      keys
+    );
 
-        await withPg(async (client) => {
-          await client.query('DELETE FROM files WHERE project_id = $1', [project_id]);
-          for (const file of blocks) {
-            await client.query(
-              'INSERT INTO files (project_id, name, language, content) VALUES ($1, $2, $3, $4)',
-              [project_id, file.nom, file.langage, file.contenu]
-            );
-            envoyer('file', { name: file.nom, language: file.langage, content: file.contenu });
-          }
-        });
+    if (!correctionResult.success) {
+      envoyer('message', { role: 'ia', content: `⚠️ Correction impossible au tour ${essais} : ${correctionResult.error || ''}` });
+      break;
+    }
 
-        const newTestResult = await testerCodePython(blocks);
+    if (correctionResult.explication) {
+      envoyer('message', {
+        role: 'ia',
+        content: `Tentative ${essais}/${MAX_ESSAIS} (${correctionResult.provider}) :\n${correctionResult.explication.substring(0, 800)}`
+      });
+    }
 
-        if (testResult.sandbox && testResult.sandbox !== newTestResult.sandbox) {
-          if (typeof testResult.sandbox.kill === 'function') {
-            await testResult.sandbox.kill().catch(() => {});
-          }
-        }
-        testResult = newTestResult;
-        sandboxFinale = testResult.sandbox;
-      } catch (e) {
-        console.log('Erreur agent:', e.message);
-        envoyer('message', { role: 'ia', content: `Erreur agent : ${e.message}` });
-        break;
+    blocks = blocks.map(b => b.nom === fichierCible.nom ? correctionResult.fichierCorrige : b);
+
+    await withPg(async (client) => {
+      await client.query('DELETE FROM files WHERE project_id = $1', [project_id]);
+      for (const file of blocks) {
+        await client.query(
+          'INSERT INTO files (project_id, name, language, content) VALUES ($1, $2, $3, $4)',
+          [project_id, file.nom, file.langage, file.contenu]
+        );
+        envoyer('file', { name: file.nom, language: file.langage, content: file.contenu });
       }
+    });
+
+    if (testResult.sandbox && typeof testResult.sandbox.kill === 'function') {
+      await testResult.sandbox.kill().catch(() => {});
     }
 
-    if (testResult.success) {
-      envoyer('message', {
-        role: 'ia',
-        content: `✅ Code testé avec succès${essais > 0 ? ` (après ${essais} correction${essais > 1 ? 's' : ''})` : ''} !\n\nSortie :\n\`\`\`\n${testResult.stdout.substring(0, 500)}\n\`\`\``
-      });
-    } else {
-      envoyer('message', {
-        role: 'ia',
-        content: `⚠️ Le code a été généré mais n'a pas pu être corrigé après ${essais} tentative(s).`
-      });
-    }
+    testResult = await testerCodePython(blocks);
+    sandboxFinale = testResult.sandbox;
+  } catch (e) {
+    console.log('Erreur correction:', e.message);
+    envoyer('message', { role: 'ia', content: `Erreur correction : ${e.message}` });
+    break;
+  }
+}
+
+if (testResult.success) {
+  envoyer('message', {
+    role: 'ia',
+    content: `✅ Code testé avec succès${essais > 0 ? ` (après ${essais} correction${essais > 1 ? 's' : ''})` : ''} !\n\nSortie :\n\`\`\`\n${testResult.stdout.substring(0, 500)}\n\`\`\``
+  });
+} else {
+  envoyer('message', {
+    role: 'ia',
+    content: `⚠️ Le code a été généré mais n'a pas pu être corrigé après ${essais} tentative(s).`
+  });
+}
 
     const ws = await withPg(async (client) => {
       const r = await client.query('SELECT * FROM workspaces WHERE project_id = $1', [project_id]);
@@ -1916,4 +1912,4 @@ process.on('SIGTERM', () => {
   console.log('SIGTERM reçu, arrêt propre...');
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 25000).unref();
-}); 
+});
