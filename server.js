@@ -8,48 +8,40 @@ const rateLimit = require('express-rate-limit');
 const antivirus = require('./agents/antivirus');
 const sandbox = require('./agents/sandbox');
 
-// [NEW] Garde-fous process
-// [FIX #23] Après une exception non gérée, l'état est incohérent → on meurt proprement
 process.on('unhandledRejection', (err) => {
-  console.error('🔴 UnhandledRejection:', err);
+  console.error('UnhandledRejection:', err);
   process.exit(1);
 });
 process.on('uncaughtException', (err) => {
-  console.error('🔴 UncaughtException:', err);
+  console.error('UncaughtException:', err);
   process.exit(1);
 });
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Constantes
 const LIMITE_FREE = 50;
 const MAX_HISTORY = 30;
 const MAX_TERMINAL_HISTORY = 10;
 
-// [FIX #18] CORS restreint
-// [FIX #5] credentials: false si wildcard (évite fuite CSRF)
 const CORS_ORIGINS_RAW = (process.env.CORS_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
 const CORS_WILDCARD = CORS_ORIGINS_RAW.length === 0 || CORS_ORIGINS_RAW.includes('*');
 const ALLOWED_ORIGINS = CORS_WILDCARD ? ['*'] : CORS_ORIGINS_RAW;
 
 app.use(cors({
   origin: CORS_WILDCARD ? true : ALLOWED_ORIGINS,
-  credentials: !CORS_WILDCARD  // pas de credentials si wildcard
+  credentials: !CORS_WILDCARD
 }));
 app.use(express.json({ limit: '2mb' }));
 
-// [FIX #20] Rate limiting sur routes coûteuses
 const iaLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 20,
-  message: { error: 'Trop de requêtes IA, réessaie dans 1 minute.' },
+  message: { error: 'Trop de requetes IA, reessaie dans 1 minute.' },
   standardHeaders: true,
   legacyHeaders: false
 });
 
-// ============================================
-// VARIABLES GLOBALES
-// ============================================
 const GLOBAL_KEYS = {
   gemini: process.env.GEMINI_API_KEY,
   neon: process.env.NEON_API_KEY,
@@ -61,23 +53,18 @@ const GLOBAL_KEYS = {
   render: process.env.RENDER_TOKEN,
   renderOwner: process.env.RENDER_OWNER_ID,
   e2b: process.env.E2B_API_KEY,
-  groq: process.env.GROQ_API_KEY,              
-  openrouter: process.env.OPENROUTER_API_KEY,  
-  
+  groq: process.env.GROQ_API_KEY,
+  openrouter: process.env.OPENROUTER_API_KEY
 };
 
-// ============================================
-// 🔥 SUIVI DES BUILDS EN COURS (pour /api/build/status)
-// ============================================
 const buildsEnCours = new Map();
 
-// [FIX #22] Clé d'encryption obligatoire hors development
 const ENCRYPTION_KEY_RAW = process.env.ENCRYPTION_KEY;
 if (!ENCRYPTION_KEY_RAW) {
   if (process.env.NODE_ENV !== 'development') {
-    throw new Error('❌ ENCRYPTION_KEY obligatoire (hors NODE_ENV=development).');
+    throw new Error('ENCRYPTION_KEY obligatoire (hors NODE_ENV=development).');
   }
-  console.warn('⚠️ ENCRYPTION_KEY absente — fallback DEV utilisé. NE PAS UTILISER EN PROD.');
+  console.warn('ENCRYPTION_KEY absente - fallback DEV utilise.');
 }
 const ENCRYPTION_KEY = crypto.scryptSync(
   ENCRYPTION_KEY_RAW || 'kenny_default_secret_key_2026',
@@ -86,77 +73,13 @@ const ENCRYPTION_KEY = crypto.scryptSync(
 );
 
 const GEMINI_MODEL = 'gemini-3.8-flash';
-const GEMINI_URL = (key) =>
-  `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${key}`;
-
-// ============================================
-// 🛡️ WHITELIST AGENT GEMINI
-// ============================================
-const AGENT_COMMAND_WHITELIST = [
-  /^ls(\s+[\w\-\.\/\*]+)*$/,
-  /^cat\s+[\w\-\.\/]+$/,
-  /^head\s+(-\d+\s+)?[\w\-\.\/]+$/,
-  /^tail\s+(-\d+\s+)?[\w\-\.\/]+$/,
-  /^find\s+\.[\s\w\-\*\.\"\'\(\)\/]+$/,
-  /^tree(\s+[\w\-\.\/]+)?$/,
-  /^pwd$/,
-  /^which\s+\w+$/,
-  /^stat\s+[\w\-\.\/]+$/,
-  /^wc\s+-l\s+[\w\-\.\/]+$/,
-  /^grep\s+(-n\s+)?["']?[\w\-\.]+["']?\s+[\w\-\.\/]+$/,
-  /^python3?\s+--version$/,
-  /^python3?\s+-c\s+["'][^"'`$\\]{1,200}["'](\s+2>&1)?$/,
-  /^python3?\s+-m\s+py_compile\s+(?!.*\.\.)[\w\-\.\/\s]+(\s+2>&1)?$/,
-  /^pip\s+list$/,
-  /^pip\s+show\s+[\w\-]+$/,
-  /^pip\s+freeze$/,
-  /^timeout\s+\d+\s+python3?\s+(run|main|app)\.py(\s+2>&1)?$/,
-  /^python3?\s+(run|main|app)\.py(\s+2>&1)?$/,
-  /^pip\s+install\s+(flask|numpy|scipy|pandas|matplotlib|requests|python-dotenv|sqlalchemy|psycopg2-binary|beautifulsoup4|lxml|openpyxl|jinja2|werkzeug)(\s+[\w\.\<\>=]+)?$/,
-  /^pip\s+install\s+-r\s+requirements\.txt$/
-];
-
-const AGENT_COMMAND_BLACKLIST = [
-  /rm\s+-rf/, /sudo/, /chmod/, /chown/,
-  /curl\s+/, /wget\s+/, /\bnc\s+/, /\bssh\s+/,
-  /apt-get/, /apt\s+/,
-  /\.\.\//, /;\s*rm/, /\|\s*sh/, /\|\s*bash/,
-  /eval\s+/, /exec\s+/, />\s*\/dev/,
-  /mkfs/, /dd\s+if=/, /:\(\)\s*\{/,
-  /-delete/, /-exec\b/, /-execdir/, /-ok\b/, /-okdir/,
-  /-fprint\b/, /-fprintf\b/, /-fls\b/,
-  /python3?\s+-c\s+["'][^"']*\b(import|from)\s+(os|sys|subprocess|shutil|pty|socket|importlib)/i,
-  /python3?\s+-c\s+["'][^"']*__import__/,
-  /python3?\s+-c\s+["'][^"']*open\s*\(/,
-  /python3?\s+-c\s+["'][^"']*exec\s*\(/,
-  /python3?\s+-c\s+["'][^"']*eval\s*\(/,
-  /`/, /\$\(/,
-  /\bos\s*\.\s*system/, /\bsubprocess\s*\./,
-];
-
-function verifierCommandeAgent(cmd) {
-  const cmdTrimmed = cmd.trim();
-  for (const regex of AGENT_COMMAND_BLACKLIST) {
-    if (regex.test(cmdTrimmed)) {
-      return { allowed: false, reason: `Commande bloquée (sécurité) : ${cmdTrimmed}` };
-    }
-  }
-  for (const regex of AGENT_COMMAND_WHITELIST) {
-    if (regex.test(cmdTrimmed)) return { allowed: true };
-  }
-  return {
-    allowed: false,
-    reason: `Commande non autorisée. Permises : ls, cat, head, tail, find, tree, pwd, python3 -c, py_compile, pip list, timeout python3 run.py, pip install.`
-  };
-}
-
-const IV_LENGTH = 16;
+const GEMINI_URL = (key) => `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${key}`;
 
 function chiffrer(text) {
   if (text === null || text === undefined) return null;
   const str = String(text);
   if (str === '') return '';
-  const iv = crypto.randomBytes(IV_LENGTH);
+  const iv = crypto.randomBytes(16);
   const cipher = crypto.createCipheriv('aes-256-cbc', ENCRYPTION_KEY, iv);
   let encrypted = cipher.update(str);
   encrypted = Buffer.concat([encrypted, cipher.final()]);
@@ -170,7 +93,6 @@ function dechiffrer(text) {
   const parts = text.split(':');
   if (parts.length !== 2) return null;
   const [ivHex, encHex] = parts;
-  // Correction de la syntaxe cassée (\vert{}\vert{} -> ||)
   if (!/^[0-9a-f]{32}$/i.test(ivHex) || !/^[0-9a-f]+$/i.test(encHex)) return null;
   try {
     const iv = Buffer.from(ivHex, 'hex');
@@ -181,15 +103,6 @@ function dechiffrer(text) {
     return decrypted.toString();
   } catch (e) {
     return null;
-  }
-}
-
-async function withPg(fn, connString = null) {
-  const client = await getNeonClient(connString);
-  try {
-    return await fn(client);
-  } finally {
-    await client.end().catch(() => {});
   }
 }
 
@@ -204,14 +117,21 @@ async function getNeonClient(connString = null) {
   return client;
 }
 
+async function withPg(fn, connString = null) {
+  const client = await getNeonClient(connString);
+  try {
+    return await fn(client);
+  } finally {
+    await client.end().catch(() => {});
+  }
+}
+
 async function verifierProprietaireProjet(firebase_uid, project_id) {
   if (!firebase_uid || !project_id) return false;
   try {
     return await withPg(async (client) => {
       const r = await client.query(
-        `SELECT p.id FROM projects p
-           JOIN users u ON u.id = p.user_id
-         WHERE p.id = $1 AND u.firebase_uid = $2`,
+        `SELECT p.id FROM projects p JOIN users u ON u.id = p.user_id WHERE p.id = $1 AND u.firebase_uid = $2`,
         [project_id, firebase_uid]
       );
       return r.rows.length > 0;
@@ -239,11 +159,6 @@ async function getKeysForUser(firebase_uid) {
         else if (k === 'NEON_API_KEY' || k === 'NEON') keys.neon = v;
         else if (k === 'NEON_CONNECTION_STRING' || k === 'NEON_CONN') keys.neonConn = v;
         else if (k === 'GITHUB_TOKEN' || k === 'GITHUB') keys.github = v;
-        else if (k === 'CLOUDFLARE_TOKEN' || k === 'CLOUDFLARE') keys.cloudflare = v;
-        else if (k === 'CLOUDFLARE_AI_TOKEN' || k === 'CLOUDFLARE_AI') keys.cloudflareAI = v;
-        else if (k === 'CLOUDFLARE_ACCOUNT_ID' || k === 'CLOUDFLARE_ACCOUNT') keys.cloudflareAccount = v;
-        else if (k === 'RENDER_TOKEN' || k === 'RENDER') keys.render = v;
-        else if (k === 'RENDER_OWNER_ID' || k === 'RENDER_OWNER') keys.renderOwner = v;
         else if (k === 'E2B_API_KEY' || k === 'E2B') keys.e2b = v;
       }
     });
@@ -256,55 +171,22 @@ async function getKeysForUser(firebase_uid) {
 async function verifierQuota(firebase_uid) {
   try {
     return await withPg(async (client) => {
-      const user = await client.query(
-        'SELECT id, plan FROM users WHERE firebase_uid = $1',
-        [firebase_uid]
-      );
-      if (user.rows.length === 0) return { allowed: false, error: 'User non trouvé' };
+      const user = await client.query('SELECT id, plan FROM users WHERE firebase_uid = $1', [firebase_uid]);
+      if (user.rows.length === 0) return { allowed: false, error: 'User non trouve' };
       const u = user.rows[0];
-
       if (u.plan === 'pro' || u.plan === 'premium') {
-        return { allowed: true, remaining: '∞', plan: u.plan };
+        return { allowed: true, remaining: 'infini', plan: u.plan };
       }
-
       const today = new Date().toISOString().split('T')[0];
-
       const updated = await client.query(
-        `UPDATE users
-           SET commands_today = CASE
-                 WHEN last_command_reset IS NULL OR last_command_reset::date <> $2::date
-                 THEN 1
-                 ELSE commands_today + 1
-               END,
-               last_command_reset = $2::date
-         WHERE id = $1
-           AND (
-             last_command_reset IS NULL
-             OR last_command_reset::date <> $2::date
-             OR commands_today < $3
-           )
-         RETURNING commands_today`,
+        `UPDATE users SET commands_today = CASE WHEN last_command_reset IS NULL OR last_command_reset::date <> $2::date THEN 1 ELSE commands_today + 1 END, last_command_reset = $2::date WHERE id = $1 AND (last_command_reset IS NULL OR last_command_reset::date <> $2::date OR commands_today < $3) RETURNING commands_today`,
         [u.id, today, LIMITE_FREE]
       );
-
       if (updated.rowCount === 0) {
-        return {
-          allowed: false,
-          error: `Limite atteinte (${LIMITE_FREE}/jour). Passe au plan Pro.`,
-          plan: u.plan,
-          used: LIMITE_FREE,
-          limit: LIMITE_FREE
-        };
+        return { allowed: false, error: `Limite atteinte (${LIMITE_FREE}/jour).`, plan: u.plan, used: LIMITE_FREE, limit: LIMITE_FREE };
       }
-
       const used = updated.rows[0].commands_today;
-      return {
-        allowed: true,
-        plan: u.plan,
-        used,
-        limit: LIMITE_FREE,
-        remaining: LIMITE_FREE - used
-      };
+      return { allowed: true, plan: u.plan, used, limit: LIMITE_FREE, remaining: LIMITE_FREE - used };
     });
   } catch (e) {
     console.error('verifierQuota error:', e.message);
@@ -1082,70 +964,44 @@ envoyer('status', { message: '🐙 Push sur GitHub...' });
     setTimeout(() => buildsEnCours.delete(project_id), 5 * 60 * 1000);
   }
 });
-async function uploaderDansSandbox(blocks) {
-  const sb = await sandbox.creerSandbox();
-  for (const block of blocks) {
-    try {
-      const parts = block.nom.split('/');
-      if (parts.length > 1) {
-        const dirPath = parts.slice(0, -1).join('/');
-        await sb.commands.run(`mkdir -p "${dirPath}"`, { timeoutMs: 5000 });
-      }
-      await sb.filesystem.write(block.nom, block.contenu);
-    } catch (e) {
-      console.log(`Erreur upload ${block.nom}:`, e.message);
-    }
-  }
-  return sb;
-}
-
-async function testerCodePython(blocks) {
+	async function testerCodePython(blocks) {
   let sb = null;
   try {
-    sb = await uploaderDansSandbox(blocks);
+    console.log(`[TEST] Début test, ${blocks.length} fichiers`);
+
+    sb = await sandbox.uploaderDansSandbox(blocks);
+    console.log(`[TEST] Sandbox créée et fichiers adés`);
 
     const mainFile = blocks.find(b => b.nom === 'run.py')
                   || blocks.find(b => b.nom === 'main.py')
                   || blocks.find(b => b.nom === 'app.py');
 
     if (!mainFile) {
+      console.log(`[TEST] ❌ Aucun fichier principal`);
       return { success: false, stderr: 'Aucun fichier principal trouvé (run.py, main.py, app.py)', stdout: '', exitCode: 1, sandbox: sb };
     }
+    console.log(`[TEST] py_compile...`);
+const allPyFiles = blocks.filter(b => b.nom.endsWith('.py')).map(b => b.nom);
+if (allPyFiles.length > 0) {
+  const pyCompile = await sb.commands.run(
+    `cd /home/user && python3 -m py_compile ${allPyFiles.join(' ')} 2>&1`,
+    { timeoutMs: 20000 }
+  );
+  console.log(`[TEST] py_compile exitCode: ${pyCompile.exitCode}`);
+  if (pyCompile.exitCode !== 0) {
+    const compileLog = (pyCompile.stdout || '') + '\n' + (pyCompile.stderr || '');
+    return {
+      success: false,
+      stdout: compileLog.substring(0, 3000),
+      stderr: `ERREUR DE SYNTAXE PYTHON :\n${tailTruncate(compileLog, 2000)}`,
+      exitCode: pyCompile.exitCode,
+      sandbox: sb
+    };
+  }
+}
 
-    const reqFile = blocks.find(b => b.nom === 'requirements.txt');
-    if (reqFile) {
-      const installResult = await sb.commands.run('pip install -r requirements.txt 2>&1', { timeoutMs: 180000 });
-      if (installResult.exitCode !== 0) {
-        const installLog = (installResult.stdout || '') + '\n' + (installResult.stderr || '');
-        return {
-          success: false,
-          stdout: installLog.substring(0, 3000),
-          stderr: `ÉCHEC PIP INSTALL (exit ${installResult.exitCode}) :\n${tailTruncate(installLog, 2000)}`,
-          exitCode: installResult.exitCode,
-          sandbox: sb
-        };
-      }
-    }
-
-    const allPyFiles = blocks.filter(b => b.nom.endsWith('.py')).map(b => b.nom);
-    if (allPyFiles.length > 0) {
-      const pyCompile = await sb.commands.run(
-        `python3 -m py_compile ${allPyFiles.join(' ')} 2>&1`,
-        { timeoutMs: 20000 }
-      );
-      if (pyCompile.exitCode !== 0) {
-        const compileLog = (pyCompile.stdout || '') + '\n' + (pyCompile.stderr || '');
-        return {
-          success: false,
-          stdout: compileLog.substring(0, 3000),
-          stderr: `ERREUR DE SYNTAXE PYTHON :\n${tailTruncate(compileLog, 2000)}`,
-          exitCode: pyCompile.exitCode,
-          sandbox: sb
-        };
-      }
-    }
-
-    const importTestScript = `import sys, os, traceback
+console.log(`[TEST] Test import...`);
+const importTestScript = `import sys, os, traceback
 sys.path.insert(0, os.getcwd())
 target = "${mainFile.nom}"
 try:
@@ -1162,9 +1018,9 @@ except Exception as e:
     print("IMPORT_ERROR_END")
     sys.exit(1)`.trim();
 
-    await sb.filesystem.write('_kenny_import_test.py', importTestScript);
+    await sb.files.write('/home/user/_kenny_import_test.py', importTestScript);
 
-    const importResult = await sb.commands.run('python3 _kenny_import_test.py 2>&1', { timeoutMs: 30000 });
+    const importResult = await sb.commands.run('cd /home/user && python3 _kenny_import_test.py 2>&1', { timeoutMs: 30000 });
     const importLog = (importResult.stdout || '') + '\n' + (importResult.stderr || '');
 
  if (importLog.includes('IMPORT_ERROR_START')) {
@@ -1189,7 +1045,7 @@ except Exception as e:
   };
 }
     const runTest = await sb.commands.run(
-  `timeout 10 python3 ${mainFile.nom} > /tmp/run_out.log 2> /tmp/run_err.log; EXIT=$?; echo "___KENNY_EXIT___:$EXIT"; echo "___KENNY_STDOUT_START___"; cat /tmp/run_out.log; echo "___KENNY_STDOUT_END___"; echo "___KENNY_STDERR_START___"; cat /tmp/run_err.log; echo "___KENNY_STDERR_END___"`,
+  `cd /home/user && timeout 10 python3 ${mainFile.nom} > /tmp/run_out.log 2> /tmp/run_err.log; EXIT=$?; echo "___KENNY_EXIT___:$EXIT"; echo "___KENNY_STDOUT_START___"; cat /tmp/run_out.log; echo "___KENNY_STDOUT_END___"; echo "___KENNY_STDERR_START___"; cat /tmp/run_err.log; echo "___KENNY_STDERR_END___"`,
   { timeoutMs: 15000 }
 );
 const runLog = (runTest.stdout || '') + '\n' + (runTest.stderr || '');
@@ -1244,11 +1100,18 @@ return {
   sandbox: sb
 };
   } catch (e) {
-    if (sb && typeof sb.kill === 'function') await sb.kill().catch(() => {});
-    return { success: false, stderr: `Erreur interne sandbox :\n${e.message}`, stdout: '', exitCode: 1 };
-  }
+  console.error('[TEST] ❌ Exception attrapée:', e);
+  console.error('[TEST] Message:', e.message);
+  console.error('[TEST] Stack:', e.stack);
+  if (sb && typeof sb.kill === 'function') await sb.kill().catch(() => {});
+      return {
+      success: false,
+      stderr: `Erreur interne sandbox :\n${e.message}\n\nStack:\n${(e.stack || '').substring(0, 800)}`,
+      stdout: '',
+      exitCode: 1
+    };
+  }      
 }
-
 // ============================================
 // 🔧 CORRECTION CIBLÉE (une seule passe, contexte préservé)
 // ============================================
