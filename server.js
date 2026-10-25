@@ -897,25 +897,64 @@ async function appelGitHubModels(messages, systemPrompt, model = 'gpt-4o') {
 
 
 // ============================================
-// 🆕 DDGS — RECHERCHE WEB (DuckDuckGo, gratuit)
+// 🆕 RECHERCHE WEB — DuckDuckGo HTML direct
 // ============================================
-let ddgsClient = null;
-
 async function rechercherWeb(query, maxResults = 3) {
   try {
-    if (!ddgsClient) {
-      const module = await import('duckduckgo-search');
-      ddgsClient = new module.DDGS();
+    console.log(`🔍 Recherche web : "${query}"`);
+    
+    const res = await axios.get('https://html.duckduckgo.com/html/', {
+      params: { q: query },
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (compatible; KennyBot/1.0)',
+        'Accept': 'text/html'
+      },
+      timeout: 15000
+    });
+    
+    const results = [];
+    const html = res.data;
+    
+    // Parse les résultats : chaque résultat est dans un <div class="result">
+    const regex = /<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?<a[^>]+class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
+    let match;
+    while ((match = regex.exec(html)) !== null && results.length < maxResults) {
+      let url = match[1];
+      // DuckDuckGo encapsule parfois les URLs
+      if (url.startsWith('//duckduckgo.com/l/?uddg=')) {
+        try {
+          url = decodeURIComponent(url.split('uddg=')[1].split('&')[0]);
+        } catch {}
+      }
+      
+      results.push({
+        titre: match[2].replace(/<[^>]+>/g, '').trim(),
+        url: url,
+        contenu: match[3].replace(/<[^>]+>/g, '').trim()
+      });
     }
-    console.log(`🔍 Recherche DDGS : "${query}"`);
-    const results = await ddgsClient.text(query, { max_results: maxResults });
-    return (results || []).map(r => ({
-      titre: r.title || '',
-      url: r.href || '',
-      contenu: r.body || ''
-    }));
+    
+    // Fallback : si le regex ne marche pas, essaie un parse plus simple
+    if (results.length === 0) {
+      const simpleRegex = /<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)<\/a>/g;
+      let m;
+      while ((m = simpleRegex.exec(html)) !== null && results.length < maxResults) {
+        let url = m[1];
+        if (url.startsWith('//duckduckgo.com/l/?uddg=')) {
+          try { url = decodeURIComponent(url.split('uddg=')[1].split('&')[0]); } catch {}
+        }
+        results.push({
+          titre: m[2].replace(/<[^>]+>/g, '').trim(),
+          url: url,
+          contenu: ''
+        });
+      }
+    }
+    
+    console.log(`✅ ${results.length} résultats trouvés`);
+    return results;
   } catch (e) {
-    console.log('⚠️ DDGS échec (non bloquant):', e.message);
+    console.log('⚠️ Recherche échec (non bloquant):', e.message);
     return [];
   }
 }
