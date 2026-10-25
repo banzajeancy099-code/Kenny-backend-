@@ -7,6 +7,7 @@ const rateLimit = require('express-rate-limit');
 
 const antivirus = require('./agents/antivirus');
 const sandbox = require('./agents/sandbox');
+const tester = require('./agents/tester');
 
 process.on('unhandledRejection', (err) => {
   console.error('UnhandledRejection:', err);
@@ -964,154 +965,7 @@ envoyer('status', { message: '🐙 Push sur GitHub...' });
     setTimeout(() => buildsEnCours.delete(project_id), 5 * 60 * 1000);
   }
 });
-	async function testerCodePython(blocks) {
-  let sb = null;
-  try {
-    console.log(`[TEST] Début test, ${blocks.length} fichiers`);
-
-    sb = await sandbox.uploaderDansSandbox(blocks);
-    console.log(`[TEST] Sandbox créée et fichiers adés`);
-
-    const mainFile = blocks.find(b => b.nom === 'run.py')
-                  || blocks.find(b => b.nom === 'main.py')
-                  || blocks.find(b => b.nom === 'app.py');
-
-    if (!mainFile) {
-      console.log(`[TEST] ❌ Aucun fichier principal`);
-      return { success: false, stderr: 'Aucun fichier principal trouvé (run.py, main.py, app.py)', stdout: '', exitCode: 1, sandbox: sb };
-    }
-    console.log(`[TEST] py_compile...`);
-const allPyFiles = blocks.filter(b => b.nom.endsWith('.py')).map(b => b.nom);
-if (allPyFiles.length > 0) {
-  const pyCompile = await sb.commands.run(
-    `cd /home/user && python3 -m py_compile ${allPyFiles.join(' ')} 2>&1`,
-    { timeoutMs: 20000 }
-  );
-  console.log(`[TEST] py_compile exitCode: ${pyCompile.exitCode}`);
-  if (pyCompile.exitCode !== 0) {
-    const compileLog = (pyCompile.stdout || '') + '\n' + (pyCompile.stderr || '');
-    return {
-      success: false,
-      stdout: compileLog.substring(0, 3000),
-      stderr: `ERREUR DE SYNTAXE PYTHON :\n${tailTruncate(compileLog, 2000)}`,
-      exitCode: pyCompile.exitCode,
-      sandbox: sb
-    };
-  }
-}
-
-console.log(`[TEST] Test import...`);
-const importTestScript = `import sys, os, traceback
-sys.path.insert(0, os.getcwd())
-target = "${mainFile.nom}"
-try:
-    import importlib.util
-    spec = importlib.util.spec_from_file_location("__test_main__", target)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    print("IMPORT_OK")
-except SystemExit:
-    print("IMPORT_OK")
-except Exception as e:
-    print("IMPORT_ERROR_START")
-    traceback.print_exc()
-    print("IMPORT_ERROR_END")
-    sys.exit(1)`.trim();
-
-    await sb.files.write('/home/user/_kenny_import_test.py', importTestScript);
-
-    const importResult = await sb.commands.run('cd /home/user && python3 _kenny_import_test.py 2>&1', { timeoutMs: 30000 });
-    const importLog = (importResult.stdout || '') + '\n' + (importResult.stderr || '');
-
- if (importLog.includes('IMPORT_ERROR_START')) {
-  const start = importLog.indexOf('IMPORT_ERROR_START') + 'IMPORT_ERROR_START'.length;
-  const end = importLog.indexOf('IMPORT_ERROR_END');
-  const traceback = importLog.substring(start, end > 0 ? end : undefined).trim();
-
-  // Détecter le fichier coupable
-  let fichierCoupable = mainFile.nom;
-  const importMatch = traceback.match(/File "[^"]*\/([^\/"]+\.py)"/);
-  if (importMatch) {
-    fichierCoupable = importMatch[1];
-  }
-
-  return {
-    success: false,
-    stdout: importLog.substring(0, 3000),
-    stderr: `ERREUR D'IMPORT DANS ${fichierCoupable} :\n\`\`\`\n${tailTruncate(traceback, 2000)}\n\`\`\``,
-    exitCode: 1,
-    fichierCoupable,
-    sandbox: sb
-  };
-}
-    const runTest = await sb.commands.run(
-  `cd /home/user && timeout 10 python3 ${mainFile.nom} > /tmp/run_out.log 2> /tmp/run_err.log; EXIT=$?; echo "___KENNY_EXIT___:$EXIT"; echo "___KENNY_STDOUT_START___"; cat /tmp/run_out.log; echo "___KENNY_STDOUT_END___"; echo "___KENNY_STDERR_START___"; cat /tmp/run_err.log; echo "___KENNY_STDERR_END___"`,
-  { timeoutMs: 15000 }
-);
-const runLog = (runTest.stdout || '') + '\n' + (runTest.stderr || '');
-
-// Parser avec marqueurs uniques
-const exitMatch = runLog.match(/___KENNY_EXIT___:(\d+)/);
-const scriptExit = exitMatch ? parseInt(exitMatch[1]) : -1;
-
-const stdoutMatch = runLog.match(/___KENNY_STDOUT_START___\n?([\s\S]*?)___KENNY_STDOUT_END___/);
-const stderrMatch = runLog.match(/___KENNY_STDERR_START___\n?([\s\S]*?)___KENNY_STDERR_END___/);
-const scriptStdout = stdoutMatch ? stdoutMatch[1].trim() : '';
-const scriptStderr = stderrMatch ? stderrMatch[1].trim() : '';
-    if (scriptExit === 0 && !scriptStderr.includes('Traceback')) {
-      return {
-        success: true,
-        stdout: `✅ Script exécuté avec succès (exit 0).\n${scriptStdout.substring(0, 500) || '(pas de sortie)'}`,
-        stderr: '', exitCode: 0, sandbox: sb
-      };
-    }
-
-    if (scriptExit === 124) {
-      const serveurPattern = /(running on|serving|listening|http:\/\/|localhost|127\.0\.0\.1|debugger|werkzeug|flask|uvicorn|gunicorn)/i;
-      const ressembleServeur = serveurPattern.test(scriptStdout) || serveurPattern.test(scriptStderr);
-      if (ressembleServeur) {
-        return {
-          success: true,
-          stdout: `✅ Serveur lancé et stable (timeout atteint).\n${scriptStdout.substring(0, 500)}`,
-          stderr: '', exitCode: 0, sandbox: sb
-        };
-      }
-      return {
-        success: false,
-        stdout: runLog.substring(0, 3000),
-        stderr: `⚠️ Le script a bloqué 10s sans afficher de serveur (timeout).\nSortie : ${scriptStdout.substring(0, 1000)}\n${tailTruncate(scriptStderr, 1000)}`,
-        exitCode: 124, sandbox: sb
-      };
-    }
-
- // Détecter le fichier coupable dans le traceback du run
-let fichierCoupable = mainFile.nom;
-const runTraceMatch = (scriptStderr || '').match(/File "[^"]*\/([^\/"]+\.py)"/);
-if (runTraceMatch) {
-  fichierCoupable = runTraceMatch[1];
-}
-
-return {
-  success: false,
-  stdout: runLog.substring(0, 3000),
-  stderr: `ERREUR D'EXÉCUTION DANS ${fichierCoupable} :\n\`\`\`\n${tailTruncate(scriptStderr, 2000)}\n\`\`\``,
-  exitCode: scriptExit,
-  fichierCoupable,
-  sandbox: sb
-};
-  } catch (e) {
-  console.error('[TEST] ❌ Exception attrapée:', e);
-  console.error('[TEST] Message:', e.message);
-  console.error('[TEST] Stack:', e.stack);
-  if (sb && typeof sb.kill === 'function') await sb.kill().catch(() => {});
-      return {
-      success: false,
-      stderr: `Erreur interne sandbox :\n${e.message}\n\nStack:\n${(e.stack || '').substring(0, 800)}`,
-      stdout: '',
-      exitCode: 1
-    };
-  }      
-}
+	
 // ============================================
 // 🔧 CORRECTION CIBLÉE (une seule passe, contexte préservé)
 // ============================================
@@ -1421,7 +1275,7 @@ envoyer('status', { message: `📦 ${blocks.length} fichiers générés` });
   updatedAt: new Date().toISOString()
 });
 envoyer('status', { message: '🧪 Test du code dans la sandbox...' }); 
-  let testResult = await testerCodePython(blocks);
+  let testResult = await tester.testerCodePython(blocks);
   sandboxFinale = testResult.sandbox;
 
   envoyer('test_result', {
@@ -1498,7 +1352,7 @@ envoyer('status', { message: '🧪 Test du code dans la sandbox...' });
         await testResult.sandbox.kill().catch(() => {});
       }
 
-      testResult = await testerCodePython(blocks);
+      testResult = await tester.testerCodePython(blocks);
       sandboxFinale = testResult.sandbox;
 
       envoyer('test_result', {
