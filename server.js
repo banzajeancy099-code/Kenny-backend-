@@ -1030,7 +1030,7 @@ async function genererAvecRouteur(prompt, systemPrompt, options = {}) {
   }
   
     // Fallback ultime → Groq (toujours en dernier)
-  if (GLOBAL_KEYS.groq && !routeur.some(r => r.nom === 'Groq')) {
+if (GLOBAL_KEYS.groq) {
     routeur.push({ 
       nom: 'Groq (final)', 
       fn: () => appelGroqCode([{ role: 'user', content: prompt }], systemPrompt)
