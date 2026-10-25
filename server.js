@@ -653,6 +653,29 @@ function extraireBlocs(text) {
     blocs.push({ langage, nom: finalNom, contenu });
   }
 
+// [FUSION] Fusionner les blocs markdown/txt sans nom en README.md
+const blocsSansNom = blocs.filter(b => /^fichier\d+\.(txt|md)$/.test(b.nom));
+const blocsNommes = blocs.filter(b => !/^fichier\d+\.(txt|md)$/.test(b.nom));
+
+if (blocsSansNom.length > 0) {
+  const contenuFusionne = blocsSansNom.map(b => b.contenu).join('\n\n');
+  const dejaReadme = blocsNommes.find(b => b.nom.toLowerCase() === 'readme.md');
+  
+  if (dejaReadme) {
+    // Fusionner dans le README existant
+    dejaReadme.contenu = dejaReadme.contenu + '\n\n' + contenuFusionne;
+  } else {
+    // Créer un README.md
+    blocsNommes.push({ langage: 'markdown', nom: 'README.md', contenu: contenuFusionne });
+  }
+  
+  blocs.length = 0;
+  blocs.push(...blocsNommes);
+  console.log(`⚠️ Fusion de ${blocsSansNom.length} blocs sans nom dans README.md`);
+}
+
+  
+
   // [FALLBACK] Si regex standard ne trouve rien, essayer de détecter les fichiers par heuristique
   if (blocs.length === 0) {
     console.log('⚠️ extraireBlocs: aucun bloc avec regex standard, essai fallback heuristique');
@@ -1257,7 +1280,9 @@ RÈGLES CRITIQUES :
 3. Code complet et fonctionnel — JAMAIS de "..." ni "TODO"
 4. requirements.txt avec TOUTES les dépendances (flask, etc.)
 5. run.py doit lancer Flask sur process.env.PORT || 3000
-6. Pas d'emojis dans le code
+6. Pour les bases de données, config.py DOIT utiliser SQLite en fallback :
+   SQLALCHEMY_DATABASE_URI = os.environ.get("DATABASE_URL", "sqlite:///kenny.db")
+   (SQLite fonctionne partout, PostgreSQL sera utilisé en production via DATABASE_URL)
 7. Ne réponds PAS avec des explications avant/après les blocs — direct les 7 blocs de code
 `;
 
