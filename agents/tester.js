@@ -269,10 +269,13 @@ async function testerCodePython(blocks) {
 
     // 3. Fichier principal
     const mainFile = blocks.find(b => b.nom === 'run.py')
-                  || blocks.find(b => b.nom === 'main.py')
-                  || blocks.find(b => b.nom === 'app.py')
-                  || blocks.find(b => b.nom === 'server.py');
-
+              || blocks.find(b => b.nom === 'main.py')
+              || blocks.find(b => b.nom === 'app.py')
+              || blocks.find(b => b.nom === 'server.py')
+              || blocks.find(b => b.nom === 'interface/serveur.py')  // ← AJOUT
+              || blocks.find(b => b.nom.endsWith('/serveur.py'))      // ← AJOUT
+              || blocks.find(b => b.nom.includes('serveur'));         // ← AJOUT
+    
     if (!mainFile) {
       return {
         success: false,
