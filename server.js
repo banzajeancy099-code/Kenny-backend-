@@ -1152,6 +1152,7 @@ app.post('/api/build/python', iaLimiter, async (req, res) => {
   let sandboxFinale = null;
 
 // Init suivi
+try {
 buildsEnCours.set(project_id, {
   active: true,
   etape: 'generation',
