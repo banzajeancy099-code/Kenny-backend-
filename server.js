@@ -1642,10 +1642,12 @@ envoyer('status', { message: '🧪 Test du code dans la sandbox...' });
 
     try {
       const fichierCoupableNom = testResult.fichierCoupable
-        || (blocks.find(b => b.nom === 'run.py')?.nom)
-        || (blocks.find(b => b.nom === 'main.py')?.nom)
-        || (blocks.find(b => b.nom === 'app.py')?.nom);
-
+    || (blocks.find(b => b.nom === 'run.py')?.nom)
+    || (blocks.find(b => b.nom === 'main.py')?.nom)
+    || (blocks.find(b => b.nom === 'app.py')?.nom)
+    || (blocks.find(b => b.nom === 'interface/serveur.py')?.nom)
+    || (blocks.find(b => b.nom.endsWith('/serveur.py'))?.nom)
+    || (blocks[0]?.nom);  // ← fallback final : le premier fichier
       const fichierCible = blocks.find(b => b.nom === fichierCoupableNom);
 
       if (!fichierCible) {
@@ -2111,4 +2113,4 @@ process.on('SIGTERM', () => {
   console.log('SIGTERM reçu, arrêt propre...');
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 25000).unref();
-});    
+});     
