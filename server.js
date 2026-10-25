@@ -749,7 +749,36 @@ if (blocsSansNom.length > 0) {
     }
   }
 
-  return blocs;
+    // [SANITIZER] Filtrer les blocs qui contiennent du XML halluciné
+  const blocsValides = blocs.filter(b => {
+    const contenu = b.contenu || '';
+    const patternsXML = [
+      /<\/?parameter[= >]/i,
+      /<\/?function[= >]/i,
+      /<\/?tool_call[= >]/i,
+      /<\/?invoke[= >]/i,
+      /<\|.*?\|>/,
+      /<tool>/i,
+    ];
+    const estHallucination = patternsXML.some(re => re.test(contenu));
+    if (estHallucination) {
+      console.log(`⚠️ Bloc "${b.nom}" rejeté (XML halluciné détecté)`);
+      return false;
+    }
+    if (contenu.length < 10) {
+      console.log(`⚠️ Bloc "${b.nom}" rejeté (trop court: ${contenu.length} car.)`);
+      return false;
+    }
+    return true;
+  });
+
+  if (blocsValides.length === 0 && blocs.length > 0) {
+    console.error(`❌ TOUS les blocs rejetés (${blocs.length} hallucinations XML)`);
+    console.error(`   Premier bloc rejeté: "${blocs[0].nom}" → "${(blocs[0].contenu || '').substring(0, 100)}"`);
+    return [];
+  }
+
+  return blocsValides;
 }
 
 function tailTruncate(s, n) {
@@ -772,7 +801,7 @@ async function appelGroqCode(messages, systemPrompt) {
         { role: 'system', content: systemPrompt },
         ...messages
       ],
-      temperature: 0.7,
+      temperature: 0.3,
       max_tokens: 8000
     },
     {
@@ -1192,9 +1221,9 @@ buildsEnCours.set(project_id, {
         /^(affiche|crée|écris|fais)\s+(un|une)?\s*(script|print|affichage)/.test(promptLower) ||
         prompt.length < 80
       ) &&
-      !/(flask|api|web|interface|serveur|server|http|route|base de données|database|sql|csv|scrap|calcul|algorithm)/.test(promptLower)
-    );
-
+        !/(flask|api|web|interface|serveur|server|http|route|base de données|database|sql|csv|scrap|calcul|algorithm)/.test(promptLower)
+);
+      
     const systemPrompt = estSimple ? `Tu es un développeur Python qui génère UNIQUEMENT ce qui est demandé, sans sur-ingénierie.
 
 DEMANDE : "${prompt}"
@@ -1302,7 +1331,7 @@ try {
     {
       systemInstruction: { parts: [{ text: systemPrompt }] },
       contents: [{ role: 'user', parts: [{ text: prompt }] }],
-      generationConfig: { temperature: 0.7, maxOutputTokens: 8000 }
+      generationConfig: { temperature: 0.3, maxOutputTokens: 8000 }
     },
     { headers: { 'Content-Type': 'application/json' }, timeout: 180000 }
   );
@@ -1319,6 +1348,13 @@ try {
         preview: reponse.substring(0, 800),
         previewFin: reponse.substring(Math.max(0, reponse.length - 400))
       });
+
+      // 🚫 Refuser le build si le modèle a halluciné
+      envoyer('error', {
+        message: '⚠️ Le modèle IA a généré du contenu invalide. Réessaie avec un prompt plus simple.'
+      });
+      if (!closed && !res.writableEnded) { res.write('event: end\ndata: {}\n\n'); res.end(); }
+      return;
     }
 
 envoyer('status', { message: `📦 ${blocks.length} fichiers générés` });
@@ -1840,4 +1876,4 @@ process.on('SIGTERM', () => {
   console.log('SIGTERM reçu, arrêt propre...');
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 25000).unref();
-});   
+});    
