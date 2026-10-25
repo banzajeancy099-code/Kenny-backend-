@@ -822,35 +822,46 @@ async function appelGroqCode(messages, systemPrompt) {
 // ============================================
 // 🆕 Mistral — GÉNÉRATION DE CODE PROPRE
 // ============================================
+
 async function appelMistralCode(messages, systemPrompt) {
   if (!GLOBAL_KEYS.mistral) throw new Error('Clé Mistral manquante');
   
   console.log('🚀 Génération via Mistral...');
   
-  const response = await axios.post(
-    'https://api.mistral.ai/v1/chat/completions',
-    {
-      model: 'mistral-small-latest',   // ← modèle gratuit (codestral-latest n'est pas inclus dans le free tier)
-      messages: [
-        { role: 'system', content: systemPrompt },
-        ...messages
-      ],
-      temperature: 0.2,
-      max_tokens: 32000
-    },
-    {
-      headers: {
-        'Authorization': `Bearer ${GLOBAL_KEYS.mistral}`,
-        'Content-Type': 'application/json'
-      },
-      timeout: 180000
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const response = await axios.post(
+        'https://api.mistral.ai/v1/chat/completions',
+        {
+          model: 'mistral-small-latest',
+          messages: [
+            { role: 'system', content: systemPrompt },
+            ...messages
+          ],
+          temperature: 0.2,
+          max_tokens: 32000
+        },
+        {
+          headers: {
+            'Authorization': `Bearer ${GLOBAL_KEYS.mistral}`,
+            'Content-Type': 'application/json'
+          },
+          timeout: 180000
+        }
+      );
+      console.log('✅ Mistral OK');
+      return response.data.choices[0].message.content;
+    } catch (e) {
+      if (e.response?.status === 429 && attempt < 3) {
+        const wait = attempt * 2000;
+        console.log(`⏳ Mistral 429, attente ${wait}ms puis retry ${attempt}/3...`);
+        await new Promise(r => setTimeout(r, wait));
+        continue;
+      }
+      throw e;
     }
-  );
-  
-  console.log('✅ Mistral OK');
-  return response.data.choices[0].message.content;
+  }
 }
-
 
 // ============================================
 // 🆕 GitHub Models — FALLBACK GPT-4o / Claude
@@ -894,23 +905,24 @@ async function rechercherWeb(query, maxResults = 3) {
   try {
     if (!ddgsClient) {
       const module = await import('duckduckgo-search');
-      ddgsClient = module;
+      ddgsClient = new module.DDGS();
     }
     console.log(`🔍 Recherche DDGS : "${query}"`);
-    const results = await ddgsClient.search(query, { 
-      maxResults: maxResults,
-      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; KennyBot/1.0)' }
-    });
+    const results = await ddgsClient.text(query, { max_results: maxResults });
     return (results || []).map(r => ({
-      titre: r.title || r.titre || '',
-      url: r.href || r.url || '',
-      contenu: r.body || r.contenu || r.snippet || ''
+      titre: r.title || '',
+      url: r.href || '',
+      contenu: r.body || ''
     }));
   } catch (e) {
     console.log('⚠️ DDGS échec (non bloquant):', e.message);
     return [];
   }
 }
+
+// ============================================
+// 🆕 DÉTECTION + CONTEXTE WEB
+// ============================================
 function besoinRechercheWeb(prompt) {
   const motsCles = [
     'flask', 'fastapi', 'django', 'sqlalchemy', 'react', 'vue', 'nextjs',
@@ -936,7 +948,6 @@ ${resultats.map((r, i) => `${i + 1}. ${r.titre}\n   ${r.url}\n   ${r.contenu.sub
 Utilise ces informations pour connaître la dernière version et les bonnes pratiques actuelles.
 `;
 }
-
 // ============================================
 // 🎯 ROUTEUR INTELLIGENT
 // ============================================
@@ -979,19 +990,11 @@ async function genererAvecRouteur(prompt, systemPrompt, options = {}) {
     });
   }
   
-  // Fallback → GitHub GPT-4o
-  if (GLOBAL_KEYS.githubModels) {
+    // Fallback ultime → Groq (toujours en dernier)
+  if (GLOBAL_KEYS.groq && !routeur.some(r => r.nom === 'Groq')) {
     routeur.push({ 
-      nom: 'GitHub GPT-4o', 
-      fn: () => appelGitHubModels([{ role: 'user', content: prompt }], systemPrompt, 'gpt-4o')
-    });
-  }
-  
-  // Fallback → GitHub Claude
-  if (GLOBAL_KEYS.githubModels) {
-    routeur.push({ 
-      nom: 'GitHub Claude', 
-      fn: () => appelGitHubModels([{ role: 'user', content: prompt }], systemPrompt, 'claude-3-5-sonnet')
+      nom: 'Groq (final)', 
+      fn: () => appelGroqCode([{ role: 'user', content: prompt }], systemPrompt)
     });
   }
   
