@@ -55,7 +55,10 @@ const GLOBAL_KEYS = {
   renderOwner: process.env.RENDER_OWNER_ID,
   e2b: process.env.E2B_API_KEY,
   groq: process.env.GROQ_API_KEY,
-  openrouter: process.env.OPENROUTER_API_KEY
+  openrouter: process.env.OPENROUTER_API_KEY,
+  // 🆕 Nouveaux providers
+  mistral: process.env.MISTRAL_API_KEY,
+  githubModels: process.env.GITHUB_TOKEN
 };
 
 const buildsEnCours = new Map();
@@ -816,6 +819,199 @@ async function appelGroqCode(messages, systemPrompt) {
   return response.data.choices[0].message.content;
 }
 
+// ============================================
+// 🆕 Mistral — GÉNÉRATION DE CODE PROPRE
+// ============================================
+async function appelMistralCode(messages, systemPrompt) {
+  if (!GLOBAL_KEYS.mistral) throw new Error('Clé Mistral manquante');
+  
+  console.log('🚀 Génération via Mistral...');
+  
+  const response = await axios.post(
+    'https://api.mistral.ai/v1/chat/completions',
+    {
+      model: 'mistral-small-latest',   // ← modèle gratuit (codestral-latest n'est pas inclus dans le free tier)
+      messages: [
+        { role: 'system', content: systemPrompt },
+        ...messages
+      ],
+      temperature: 0.2,
+      max_tokens: 32000
+    },
+    {
+      headers: {
+        'Authorization': `Bearer ${GLOBAL_KEYS.mistral}`,
+        'Content-Type': 'application/json'
+      },
+      timeout: 180000
+    }
+  );
+  
+  console.log('✅ Mistral OK');
+  return response.data.choices[0].message.content;
+}
+
+
+// ============================================
+// 🆕 GitHub Models — FALLBACK GPT-4o / Claude
+// ============================================
+async function appelGitHubModels(messages, systemPrompt, model = 'gpt-4o') {
+  if (!GLOBAL_KEYS.githubModels) throw new Error('Token GitHub Models manquant');
+  
+  console.log(`🔄 Fallback GitHub Models ${model}...`);
+  
+  const response = await axios.post(
+    'https://models.inference.ai.azure.com/chat/completions',
+    {
+      model: model,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        ...messages
+      ],
+      temperature: 0.2,
+      max_tokens: 16000
+    },
+    {
+      headers: {
+        'Authorization': `Bearer ${GLOBAL_KEYS.githubModels}`,
+        'Content-Type': 'application/json'
+      },
+      timeout: 120000
+    }
+  );
+  
+  console.log('✅ GitHub Models OK');
+  return response.data.choices[0].message.content;
+}
+
+
+// ============================================
+// 🆕 DDGS — RECHERCHE WEB (DuckDuckGo, gratuit)
+// ============================================
+let ddgsClient = null;
+
+async function rechercherWeb(query, maxResults = 3) {
+  try {
+    if (!ddgsClient) {
+      const module = await import('duckduckgo-search');
+      ddgsClient = module;
+    }
+    console.log(`🔍 Recherche DDGS : "${query}"`);
+    const results = await ddgsClient.search(query, { 
+      maxResults: maxResults,
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; KennyBot/1.0)' }
+    });
+    return (results || []).map(r => ({
+      titre: r.title || r.titre || '',
+      url: r.href || r.url || '',
+      contenu: r.body || r.contenu || r.snippet || ''
+    }));
+  } catch (e) {
+    console.log('⚠️ DDGS échec (non bloquant):', e.message);
+    return [];
+  }
+}
+function besoinRechercheWeb(prompt) {
+  const motsCles = [
+    'flask', 'fastapi', 'django', 'sqlalchemy', 'react', 'vue', 'nextjs',
+    'numpy', 'pandas', 'xgboost', 'scikit-learn', 'tensorflow', 'pytorch',
+    'version', 'dernière', 'latest', 'documentation', 'doc'
+  ];
+  return motsCles.some(m => prompt.toLowerCase().includes(m));
+}
+
+async function chercherContexteWeb(prompt) {
+  if (!besoinRechercheWeb(prompt)) return '';
+  const match = prompt.toLowerCase().match(
+    /\b(flask|fastapi|django|sqlalchemy|react|vue|nextjs|numpy|pandas|xgboost|scikit-learn|tensorflow|pytorch)\b/
+  );
+  if (!match) return '';
+  const lib = match[1];
+  const resultats = await rechercherWeb(`${lib} python latest version 2026`);
+  if (resultats.length === 0) return '';
+  return `
+INFORMATIONS WEB RÉCENTES (${lib}) :
+${resultats.map((r, i) => `${i + 1}. ${r.titre}\n   ${r.url}\n   ${r.contenu.substring(0, 300)}`).join('\n\n')}
+
+Utilise ces informations pour connaître la dernière version et les bonnes pratiques actuelles.
+`;
+}
+
+// ============================================
+// 🎯 ROUTEUR INTELLIGENT
+// ============================================
+async function genererAvecRouteur(prompt, systemPrompt, options = {}) {
+  const { estSimple = false } = options;
+  const routeur = [];
+  
+  // Prompt simple → Groq (ultra-rapide)
+  if (estSimple && GLOBAL_KEYS.groq) {
+    routeur.push({ 
+      nom: 'Groq', 
+      fn: () => appelGroqCode([{ role: 'user', content: prompt }], systemPrompt)
+    });
+  }
+  
+  // Code standard → Mistral (propre)
+  if (GLOBAL_KEYS.mistral) {
+    routeur.push({ 
+      nom: 'Mistral', 
+      fn: () => appelMistralCode([{ role: 'user', content: prompt }], systemPrompt)
+    });
+  }
+  
+  // Fallback → Gemini
+  if (GLOBAL_KEYS.gemini) {
+    routeur.push({ 
+      nom: 'Gemini', 
+      fn: async () => {
+        const response = await axios.post(
+          GEMINI_URL(GLOBAL_KEYS.gemini),
+          {
+            systemInstruction: { parts: [{ text: systemPrompt }] },
+            contents: [{ role: 'user', parts: [{ text: prompt }] }],
+            generationConfig: { temperature: 0.2, maxOutputTokens: 32000 }
+          },
+          { headers: { 'Content-Type': 'application/json' }, timeout: 180000 }
+        );
+        return response.data.candidates[0].content.parts[0].text;
+      }
+    });
+  }
+  
+  // Fallback → GitHub GPT-4o
+  if (GLOBAL_KEYS.githubModels) {
+    routeur.push({ 
+      nom: 'GitHub GPT-4o', 
+      fn: () => appelGitHubModels([{ role: 'user', content: prompt }], systemPrompt, 'gpt-4o')
+    });
+  }
+  
+  // Fallback → GitHub Claude
+  if (GLOBAL_KEYS.githubModels) {
+    routeur.push({ 
+      nom: 'GitHub Claude', 
+      fn: () => appelGitHubModels([{ role: 'user', content: prompt }], systemPrompt, 'claude-3-5-sonnet')
+    });
+  }
+  
+  let derniereErreur;
+  for (const provider of routeur) {
+    try {
+      const reponse = await provider.fn();
+      if (reponse && reponse.length > 50) {
+        console.log(`✅ ${provider.nom} a répondu (${reponse.length} car.)`);
+        return { success: true, reponse, provider: provider.nom };
+      }
+    } catch (e) {
+      console.log(`❌ ${provider.nom} échoue : ${e.message}`);
+      derniereErreur = e;
+    }
+  }
+  
+  return { success: false, error: derniereErreur?.message || 'Tous les providers ont échoué' };
+}
+
 // --- OpenRouter : CORRECTION (agent, 50 req/jour gratuit) ---
 async function appelOpenRouterCorrection(messages, systemPrompt) {
   if (!GLOBAL_KEYS.openrouter) throw new Error('Clé OpenRouter manquante');
@@ -1315,29 +1511,26 @@ RÈGLES CRITIQUES :
 7. Ne réponds PAS avec des explications avant/après les blocs — direct les 7 blocs de code
 `;
 
-    let reponse;
-try {
-  envoyer('status', { message: '🤖 Génération via Groq...' });
-  reponse = await appelGroqCode(
-    [{ role: 'user', content: prompt }],
-    systemPrompt
-  );
-  envoyer('status', { message: '✅ Généré par Groq' });
-} catch (err) {
-  console.log('Groq échec, fallback Gemini:', err.message);
-  envoyer('status', { message: '⚠️ Groq échec, fallback Gemini...' });
-  const response = await axios.post(
-    GEMINI_URL(keys.gemini),
-    {
-      systemInstruction: { parts: [{ text: systemPrompt }] },
-      contents: [{ role: 'user', parts: [{ text: prompt }] }],
-      generationConfig: { temperature: 0.3, maxOutputTokens: 8000 }
-    },
-    { headers: { 'Content-Type': 'application/json' }, timeout: 180000 }
-  );
-  reponse = response.data.candidates[0].content.parts[0].text;
-  envoyer('status', { message: '✅ Généré par Gemini (fallback)' });
+    // 🎯 Recherche web si la lib est mentionnée
+envoyer('status', { message: '🔍 Analyse de la demande...' });
+const contexteWeb = await chercherContexteWeb(prompt);
+if (contexteWeb) {
+  systemPrompt += `\n\n${contexteWeb}`;
+  envoyer('status', { message: '✅ Contexte web ajouté' });
 }
+
+// 🎯 Routeur intelligent
+envoyer('status', { message: '🤖 Génération multi-providers...' });
+const genResult = await genererAvecRouteur(prompt, systemPrompt, { estSimple });
+
+if (!genResult.success) {
+  envoyer('error', { message: '❌ Aucun provider n\'a pu générer : ' + genResult.error });
+  if (!closed && !res.writableEnded) { res.write('event: end\ndata: {}\n\n'); res.end(); }
+  return;
+}
+
+let reponse = genResult.reponse;
+envoyer('status', { message: `✅ Généré par ${genResult.provider}` });
     let blocks = extraireBlocs(reponse);
 
     // [DEBUG] Voir la réponse brute de Groq si 0 fichiers
