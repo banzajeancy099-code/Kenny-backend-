@@ -1159,9 +1159,50 @@ buildsEnCours.set(project_id, {
   startedAt: new Date().toISOString()
 });
 
-try {
-  envoyer('status', { message: '🧠 Génération du code Python...' });
-            const systemPrompt = `Tu es un développeur expert en Python, Flask et data science.
+    // 🎯 Détection de la complexité du prompt
+    const promptLower = prompt.toLowerCase();
+    const estSimple = (
+      /^[^a-z]*$/.test(promptLower) === false &&
+      (
+        /(print|affiche|hello|bonjour|console|terminal)\s+(simple|basique)?/.test(promptLower) ||
+        /^(affiche|crée|écris|fais)\s+(un|une)?\s*(script|print|affichage)/.test(promptLower) ||
+        prompt.length < 80
+      ) &&
+      !/(flask|api|web|interface|serveur|server|http|route|base de données|database|sql|csv|scrap|calcul|algorithm)/.test(promptLower)
+    );
+
+    const systemPrompt = estSimple ? `Tu es un développeur Python qui génère UNIQUEMENT ce qui est demandé, sans sur-ingénierie.
+
+DEMANDE : "${prompt}"
+
+STRUCTURE OBLIGATOIRE — MAXIMUM 2 FICHIERS :
+1. run.py — le script qui fait exactement ce qui est demandé
+2. requirements.txt — dépendances (vide si aucune)
+
+INTERDICTIONS ABSOLUES :
+- PAS de Flask, Django, FastAPI sauf si explicitement demandé
+- PAS de serveur web
+- PAS de templates HTML
+- PAS de structure moteur/interface/templates sauf si demandé
+- PAS de dossiers inutiles
+
+FORMAT DE SORTIE — RÈGLE ABSOLUE :
+
+\`\`\`python:run.py
+print("Hello Kenny")
+\`\`\`
+
+\`\`\`txt:requirements.txt
+# Aucune dépendance externe
+\`\`\`
+
+RÈGLES CRITIQUES :
+1. TOUJOURS 3 backticks + langue:nom_fichier + saut de ligne
+2. Si la demande est "affiche Hello Kenny", run.py = print("Hello Kenny")
+3. Ne pas inventer de fonctionnalités non demandées
+4. requirements.txt vide = commentaire seulement
+5. Direct les blocs, PAS d'explications avant/après
+` : `Tu es un développeur expert en Python, Flask et data science.
 
 Génère une application COMPLÈTE et FONCTIONNELLE avec cette structure OBLIGATOIRE :
 1. moteur/config.py
@@ -1217,8 +1258,7 @@ RÈGLES CRITIQUES :
 5. run.py doit lancer Flask sur process.env.PORT || 3000
 6. Pas d'emojis dans le code
 7. Ne réponds PAS avec des explications avant/après les blocs — direct les 7 blocs de code
-
-Si tu ne respectes pas exactement ce format, ton code sera rejeté.`;
+`;
 
     let reponse;
 try {
