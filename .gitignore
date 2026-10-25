@@ -1,0 +1,12 @@
+# Backups
+*.backup
+*.backup-*
+*.save
+*.old
+*.clean
+*.cassé
+*.before-autofix
+package.j.save
+
+# Node
+node_modules/
