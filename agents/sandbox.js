@@ -139,28 +139,30 @@ async function uploaderDansSandbox(blocks) {
 
   // Toute erreur après ce point doit kill la sandbox (fuite E2B évitée)
     try {
-  // 0) Filtrer les fichiers valides AVANT le log (comptage cohérent)   
-  const fichiersValides = blocks.filter(...);                        
-  const fichiersRejetes = blocks.filter(b =>                          
-    !b || !b.nom || !nomFichierValide(b.nom)                           
-  );                                                                
-                                                                          
-  if (fichiersValides.length === 0) {                              
-    const noms = ...                                                    
-    ...                                                                  
-    throw new Error(                                                     
-      `uploaderDansSandbox : aucun fichier valide. ` +                   
-      `Noms rejetés : ...`                                               
-    );                                                                   
-  }                                                                      
-                                                                          
-  console.log(                                                           
-  `📤 Upload de ...` +                                                 
-  (fichiersRejetes.length > 0                                       
-    ? `...`                                                             
-    : '') +                                                            
-  ' dans la sandbox...'                                                
-);                                                                     
+// 0) Filtrer les fichiers valides AVANT le log (comptage cohérent)
+const fichiersValides = blocks.filter(b => b && nomFichierValide(b.nom));
+const fichiersRejetes = blocks.filter(b =>
+  !b || !b.nom || !nomFichierValide(b.nom)
+);
+
+if (fichiersValides.length === 0) {
+  const noms = fichiersRejetes.map(b => b.nom).slice(0, 5);
+  const plus = fichiersRejetes.length > 5
+    ? ` (+${fichiersRejetes.length - 5} autres)`
+    : '';
+  throw new Error(
+    `uploaderDansSandbox : aucun fichier valide. ` +
+    `Noms rejetés : ${noms.map(n => n || '(sans nom)').join(', ')}${plus}`
+  );
+}
+
+console.log(
+  `📤 Upload de ${fichiersValides.length} fichiers` +
+  (fichiersRejetes.length > 0
+    ? ` (${fichiersRejetes.length} ignoré(s) : nom invalide)`
+    : '') +
+  ' dans la sandbox...'
+);                       
     // 1) Créer tous les sous-dossiers nécessaires (mkdir -p)
     const dirs = new Set();
     for (const b of fichiersValides) {
