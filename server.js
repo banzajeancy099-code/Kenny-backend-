@@ -8,6 +8,7 @@ const rateLimit = require('express-rate-limit');
 const antivirus = require('./agents/antivirus');
 const sandbox = require('./agents/sandbox');
 const tester = require('./agents/tester');
+const pgvector = require('pgvector/pg');
 
 process.on('unhandledRejection', (err) => {
   console.error('UnhandledRejection:', err);
