@@ -170,20 +170,32 @@ else:
   );
 
   const out = res.stdout + '\n' + res.stderr;
+if (out.includes('IMPORT_ERRORS_START') || res.exitCode !== 0) {
+  const match = out.match(/### MODULE ([\w.]+)\n([\s\S]*?)(?=### MODULE|IMPORT_ERRORS_END|$)/);
+  const moduleEnErreur = match ? match[1] : '?';
+  const traceback = match ? match[2].trim() : out;
+  
+  // ⚠️ FIX #3 + #8 : Ignorer _test_imports.py et _kenny_*
+  const allMatches = [...traceback.matchAll(/File "\/home\/user\/([^"]+\.py)"/g)];
+  const fichiersProjet = allMatches
+    .map(m => m[1])
+    .filter(f => 
+      !f.startsWith('_test') && 
+      !f.startsWith('_kenny') && 
+      f !== '_test_imports.py'
+    );
+  
+  // Prendre le premier fichier du projet (le plus profond dans la stack)
+  const fichierCoupable = fichiersProjet.length > 0 
+    ? fichiersProjet[0] 
+    : moduleEnErreur.replace(/\./g, '/') + '.py';
 
-  if (out.includes('IMPORT_ERRORS_START') || res.exitCode !== 0) {
-    const match = out.match(/### MODULE ([\w.]+)\n([\s\S]*?)(?=### MODULE|IMPORT_ERRORS_END|$)/);
-    const moduleEnErreur = match ? match[1] : '?';
-    const traceback = match ? match[2].trim() : out;
-    const fileMatch = traceback.match(/File "\/home\/user\/([^"]+\.py)"/);
-
-    return {
-      success: false,
-      stderr: `ERREUR D'IMPORT dans ${moduleEnErreur} :\n\`\`\`\n${traceback.substring(0, 2500)}\n\`\`\``,
-      fichierCoupable: fileMatch ? fileMatch[1] : null
-    };
-  }
-
+  return {
+    success: false,
+    stderr: `ERREUR D'IMPORT dans ${moduleEnErreur} :\n\`\`\`\n${traceback.substring(0, 2500)}\n\`\`\``,
+    fichierCoupable
+  };
+}
   return { success: true };
 }
 
