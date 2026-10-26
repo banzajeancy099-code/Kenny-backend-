@@ -254,14 +254,26 @@ echo "___ERR_END___"
     };
   }
 
-  // Cas 3 : crash
-  const fileMatch = stderr.match(/File "\/home\/user\/([^"]+\.py)"/);
-  return {
-    success: false,
-    stderr: `ERREUR D'EXÉCUTION dans ${fileMatch ? fileMatch[1] : mainFile.nom} :\n\`\`\`\n${stderr.substring(0, 2500)}\n\`\`\``,
-    fichierCoupable: fileMatch ? fileMatch[1] : mainFile.nom
-  };
-}
+// Cas 3 : crash
+// ⚠️ FIX #8 : Ignorer les fichiers internes
+const allMatches = [...stderr.matchAll(/File "\/home\/user\/([^"]+\.py)"/g)];
+const fichiersProjet = allMatches
+  .map(m => m[1])
+  .filter(f => 
+    !f.startsWith('_test') && 
+    !f.startsWith('_kenny') && 
+    f !== '_test_imports.py'
+  );
+
+const fichierCoupable = fichiersProjet.length > 0 
+  ? fichiersProjet[0] 
+  : mainFile.nom;
+
+return {
+  success: false,
+  stderr: `ERREUR D'EXÉCUTION dans ${fichierCoupable} :\n\`\`\`\n${stderr.substring(0, 2500)}\n\`\`\``,
+  fichierCoupable
+};
 
 // ============================================
 // 🚀 PIPELINE COMPLET
