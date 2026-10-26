@@ -547,11 +547,17 @@ async function creerServiceRender(name, repoUrl, userToken, ownerId, langage = '
     return { success: false, error: e.response?.data?.message || e.message };
   }
 }
+
 const workspaceLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 5,
-  message: { error: "Trop de créations de workspace, réessaie dans 1 minute." }
+  message: { error: 'Trop de créations de workspace, réessaie dans 1 minute.' }
 });
+
+async function creerZoneCloudflare() {
+  return { success: false, skipped: true, reason: 'Cloudflare non implémenté' };
+}
+
 
 
 app.post('/api/workspaces/create', workspaceLimiter, async (req, res) => {
