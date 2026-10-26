@@ -493,7 +493,28 @@ async function creerProjetNeon(name, neonKey) {
 
 async function creerServiceRender(name, repoUrl, userToken, ownerId, langage = 'web') {
   if (!userToken || !ownerId) return { success: false, skipped: true, reason: 'Token Render non configuré' };
-  if (!repoUrl)return { success: false, skipped: true, reason: 'Repo GitHub indisponible' };
+  if (!repoUrl) return { success: false, skipped: true, reason: 'Repo GitHub indisponible' };
+
+  // 🔧 Vérifier que le repo contient du code avant de créer le service
+  try {
+    const repoPath = repoUrl.replace('https://github.com/', '').replace(/\.git$/, '');
+    const checkRes = await axios.get(
+      `https://api.github.com/repos/${repoPath}/contents`,
+      { headers: { 'Authorization': `token ${userToken}`, 'Accept': 'application/vnd.github.v3+json' } }
+    );
+    const files = checkRes.data || [];
+    const hasCode = files.some(f =>
+      ['run.py', 'app.py', 'main.py', 'server.js', 'package.json', 'requirements.txt'].includes(f.name)
+    );
+    if (!hasCode) {
+      console.log(`⏭️ Render skip : repo ${repoPath} vide (${files.length} fichiers)`);
+      return { success: false, skipped: true, reason: 'Repo vide — déploiement différé jusqu\'au premier build' };
+    }
+  } catch (e) {
+    console.log(`⏭️ Render skip : vérif repo échouée (${e.message})`);
+    return { success: false, skipped: true, reason: `Vérification repo échouée : ${e.message}` };
+  }
+
   try {
     const serviceName = 'kenny-' + name.toLowerCase().replace(/[^a-z0-9-]/g, '-').substring(0, 40) + '-' + Date.now().toString(36);
 
@@ -526,16 +547,6 @@ async function creerServiceRender(name, repoUrl, userToken, ownerId, langage = '
     return { success: false, error: e.response?.data?.message || e.message };
   }
 }
-
-async function creerZoneCloudflare() {
-  return { success: false, skipped: true, reason: 'Cloudflare désactivé temporairement' };
-}
-
-const workspaceLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 5,
-  message: { error: 'Trop de créations de workspace, réessaie dans 1 minute.' }
-});
 
 app.post('/api/workspaces/create', workspaceLimiter, async (req, res) => {
   const { firebase_uid, project_id, project_name } = req.body;
@@ -1061,7 +1072,7 @@ async function appelOpenRouterCorrection(messages, systemPrompt) {
   const response = await axios.post(
     'https://openrouter.ai/api/v1/chat/completions',
     {
-      model: 'poolside/laguna-s-2.1:free',
+      model: 'nvidia/nemotron-3-ultra-550b-a55b:free',
       messages: [
         { role: 'system', content: systemPrompt },
         ...messages
@@ -1302,7 +1313,7 @@ RÈGLES STRICTES :
     const response = await axios.post(
       'https://openrouter.ai/api/v1/chat/completions',
       {
-        model: 'poolside/laguna-s-2.1:free',
+        model: 'nvidia/nemotron-3-ultra-550b-a55b:free',
         messages: [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: `Corrige ${fichier.nom}` }
@@ -1370,9 +1381,50 @@ RÈGLES STRICTES :
     console.log(`❌ Gemini échec pour ${fichier.nom}:`, err.message);
   }
 
+    // Essai 3 : Groq Qwen (stable, gratuit, rapide)
+  try {
+    console.log(`🔧 Fallback Groq pour ${fichier.nom}...`);
+    const response = await axios.post(
+      'https://api.groq.com/openai/v1/chat/completions',
+      {
+        model: 'qwen/qwen3.8-27b',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: `Corrige ${fichier.nom}` }
+        ],
+        temperature: 0.2,
+        max_tokens: 8000
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${keys.groq}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 120000
+      }
+    );
+
+    const reponse = response.data.choices[0].message.content;
+    const blocs = extraireBlocs(reponse);
+    const fichierCorrige = blocs.find(b => b.nom === fichier.nom);
+
+    if (fichierCorrige) {
+      console.log(`✅ ${fichier.nom} corrigé par Groq`);
+      return {
+        success: true,
+        fichierCorrige: { ...fichier, contenu: fichierCorrige.contenu },
+        explication: reponse.replace(/```[\s\S]*?```/g, '').trim(),
+        provider: 'groq'
+      };
+    }
+    throw new Error('Groq n\'a pas renvoyé le fichier');
+  } catch (err) {
+    console.log(`❌ Groq échec pour ${fichier.nom}:`, err.message);
+  }
+
   return {
     success: false,
-    error: 'Ni OpenRouter ni Gemini n\'ont pu corriger'
+    error: 'Ni Gemini ni OpenRouter ni Groq n\'ont pu corriger'
   };
 }
 
@@ -1496,13 +1548,15 @@ RÈGLES CRITIQUES :
 ` : `Tu es un développeur expert en Python, Flask et data science.
 
 Génère une application COMPLÈTE et FONCTIONNELLE avec cette structure OBLIGATOIRE :
-1. moteur/config.py
-2. moteur/moteur.py
-3. interface/serveur.py
-4. templates/index.html
-5. data/donnees.json
-6. requirements.txt
-7. run.py
+1. moteur/__init__.py (vide)
+2. moteur/config.py
+3. moteur/moteur.py
+4. interface/__init__.py (vide)
+5. interface/serveur.py
+6. templates/index.html
+7. data/donnees.json
+8. requirements.txt
+9. run.py
 
 FORMAT DE SORTIE — RÈGLE ABSOLUE (sinon ton travail est REJETÉ) :
 
@@ -1550,7 +1604,15 @@ RÈGLES CRITIQUES :
 6. Pour les bases de données, config.py DOIT utiliser SQLite en fallback :
    SQLALCHEMY_DATABASE_URI = os.environ.get("DATABASE_URL", "sqlite:///kenny.db")
    (SQLite fonctionne partout, PostgreSQL sera utilisé en production via DATABASE_URL)
-7. Ne réponds PAS avec des explications avant/après les blocs — direct les 7 blocs de code
+7. FICHIERS OBLIGATOIRES — TOUJOURS GÉNÉRER CES 7 FICHIERS :
+   - moteur/config.py, moteur/moteur.py
+   - interface/serveur.py (avec create_app())
+   - templates/index.html
+   - data/donnees.json (données d'exemple réelles)
+   - requirements.txt (liste COMPLÈTE des dépendances)
+   - run.py (même si create_app() est dans serveur.py, run.py DOIT exister et lancer Flask sur PORT)
+   - __init__.py pour chaque dossier (moteur/__init__.py, interface/__init__.py)
+8. Ne réponds PAS avec des explications avant/après les blocs — direct les blocs de code
 `;
 
     // 🎯 Recherche web si la lib est mentionnée
@@ -2099,6 +2161,81 @@ app.get('/api/quota/:firebase_uid', async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+// ============================================
+// 🚀 /api/deploy — Déploiement manuel (bouton "Déployer")
+// ============================================
+app.post('/api/deploy', iaLimiter, async (req, res) => {
+  const { firebase_uid, project_id, project_name } = req.body;
+  if (!firebase_uid || !project_id || !project_name) {
+    return res.status(400).json({ error: 'Champs requis : firebase_uid, project_id, project_name' });
+  }
+
+  const owns = await verifierProprietaireProjet(firebase_uid, project_id);
+  if (!owns) return res.status(403).json({ error: 'Accès refusé à ce projet' });
+
+  const keys = await getKeysForUser(firebase_uid);
+  if (!keys.render || !keys.renderOwner) {
+    return res.status(400).json({ error: 'Token Render non configuré' });
+  }
+
+  try {
+    // 1) Récupère le workspace
+    const ws = await withPg(async (client) => {
+      const r = await client.query('SELECT * FROM workspaces WHERE project_id = $1', [project_id]);
+      return r.rows[0] || null;
+    });
+    if (!ws) return res.status(404).json({ error: 'Aucun workspace pour ce projet' });
+    if (!ws.github_repo) return res.status(400).json({ error: 'Repo GitHub non créé' });
+
+    // 2) Détermine le langage (python si run.py, sinon web)
+    const files = await withPg(async (client) => {
+      const r = await client.query('SELECT name FROM files WHERE project_id = $1', [project_id]);
+      return r.rows;
+    });
+    const langage = files.some(f => f.name === 'run.py' || f.name.endsWith('.py')) ? 'python' : 'web';
+
+    // 3) Crée le service Render s'il n'existe pas
+    let renderResult;
+    if (ws.render_service_id) {
+      renderResult = { success: true, service_id: ws.render_service_id, service_url: ws.render_service_url, reused: true };
+    } else {
+      // push GitHub d'abord (au cas où pas fait)
+      const allFiles = await withPg(async (client) => {
+        const r = await client.query('SELECT name, language, content FROM files WHERE project_id = $1', [project_id]);
+        return r.rows.map(f => ({ nom: f.name, langage: f.language, contenu: f.content }));
+      });
+      if (allFiles.length > 0) {
+        await pushGitHubMultiDossiers(ws.github_repo, allFiles, keys.github);
+      }
+      renderResult = await creerServiceRender(project_name, ws.github_clone_url, keys.render, keys.renderOwner, langage);
+    }
+
+    if (!renderResult.success) {
+      return res.status(500).json({
+        error: renderResult.reason || renderResult.error || 'Déploiement Render échoué',
+        skipped: renderResult.skipped || false
+      });
+    }
+
+    // 4) Met à jour le workspace
+    await withPg(async (client) => {
+      await client.query(
+        'UPDATE workspaces SET render_service_id = $1, render_service_url = $2 WHERE project_id = $3',
+        [renderResult.service_id, renderResult.service_url, project_id]
+      );
+    });
+
+    res.json({
+      success: true,
+      service_id: renderResult.service_id,
+      service_url: renderResult.service_url,
+      message: renderResult.reused ? 'Service existant réutilisé' : 'Service créé — build en cours (~3 min)'
+    });
+  } catch (e) {
+    console.error('Erreur /api/deploy:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
 
 const server = app.listen(PORT, () => {
   console.log('Kenny serveur sur le port ' + PORT);
@@ -2109,8 +2246,36 @@ server.on('error', (err) => {
   process.exit(1);
 });
 
-process.on('SIGTERM', () => {
-  console.log('SIGTERM reçu, arrêt propre...');
-  server.close(() => process.exit(0));
-  setTimeout(() => process.exit(0), 25000).unref();
-});     
+// ============================================
+// 🔒 FERMETURE PROPRE (Render envoie SIGTERM avant de tuer)
+// ============================================
+let _arretEnCours = false;
+
+async function _arretPropre(signal) {
+  if (_arretEnCours) return;
+  _arretEnCours = true;
+  console.log(`${signal} reçu — arrêt propre...`);
+
+  // 1) Fermer la sandbox E2B EN PREMIER (sinon facturée 1h de plus)
+  try {
+    await sandbox.fermerSandbox();
+    console.log('✅ Sandbox E2B fermée');
+  } catch (e) {
+    console.error('❌ Erreur fermeture sandbox:', e.message);
+  }
+
+  // 2) Fermer le serveur HTTP
+  server.close(() => {
+    console.log('✅ Serveur HTTP fermé');
+    process.exit(0);
+  });
+
+  // 3) Forcer la sortie si le serveur ne se ferme pas en 5s
+  setTimeout(() => {
+    console.log('⏱️ Forçage sortie après 5s');
+    process.exit(0);
+  }, 5000).unref();
+}
+
+process.on('SIGTERM', () => _arretPropre('SIGTERM'));
+process.on('SIGINT',  () => _arretPropre('SIGINT'));
