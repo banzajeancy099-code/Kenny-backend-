@@ -547,6 +547,12 @@ async function creerServiceRender(name, repoUrl, userToken, ownerId, langage = '
     return { success: false, error: e.response?.data?.message || e.message };
   }
 }
+const workspaceLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 5,
+  message: { error: "Trop de créations de workspace, réessaie dans 1 minute." }
+});
+
 
 app.post('/api/workspaces/create', workspaceLimiter, async (req, res) => {
   const { firebase_uid, project_id, project_name } = req.body;
