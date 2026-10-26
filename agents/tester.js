@@ -279,6 +279,27 @@ async function testerCodePython(blocks) {
     const typeInfo = detecterTypeProjet(blocks);
     console.log(`[TEST] Type détecté: ${typeInfo.type}`);
 
+    // 🔧 FIX #6 : Créer les __init__.py manquants
+const pyFiles = blocks.filter(b => b.nom.endsWith('.py'));
+const dirsWithPy = new Set();
+for (const f of pyFiles) {
+  const parts = f.nom.split('/');
+  if (parts.length > 1) {
+    dirsWithPy.add(parts.slice(0, -1).join('/'));
+  }
+}
+
+for (const dir of dirsWithPy) {
+  const initPath = `${dir}/__init__.py`;
+  if (!blocks.some(b => b.nom === initPath)) {
+    try {
+      await sb.commands.run(`cd ${ROOT} && touch ${initPath}`, { timeoutMs: 5000 });
+      console.log(`📝 ${initPath} créé (auto)`);
+    } catch (e) {
+      console.log(`⚠️ Impossible de créer ${initPath}:`, e.message);
+    }
+  }
+}
     // 3. Fichier principal
     const mainFile = blocks.find(b => b.nom === 'run.py')
               || blocks.find(b => b.nom === 'main.py')
