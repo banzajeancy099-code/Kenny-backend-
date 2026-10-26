@@ -1,12 +1,15 @@
-# Backups
-*.backup
-*.backup-*
-*.save
-*.old
-*.clean
-*.cassé
-*.before-autofix
-package.j.save
+# Secrets
+.env
+.env.local
+.env.*.local
 
-# Node
+# Logs
+*.log
+
+# Cache
 node_modules/
+
+# Fichiers de test locaux (à ne pas pusher)
+test-neon.js
+init-memoire.js
+test_antivirus.js
