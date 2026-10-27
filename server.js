@@ -9,6 +9,7 @@ const antivirus = require('./agents/antivirus');
 const sandbox = require('./agents/sandbox');
 const tester = require('./agents/tester');
 const pgvector = require('pgvector/pg');
+const memoire = require('./agents/memoire');
 
 process.on('unhandledRejection', (err) => {
   console.error('UnhandledRejection:', err);
@@ -1542,108 +1543,7 @@ RÈGLES STRICTES :
     error: 'Ni Gemini ni OpenRouter ni Groq n\'ont pu corriger'
   };
 }
-          'HTTP-Referer': 'https://kenny.dev',
-          'X-Title': 'Kenny'
-        },
-        timeout: 180000
-      }
-    );
-
-    const reponse = response.data.choices[0].message.content;
-    const blocs = extraireBlocs(reponse);
-    const fichierCorrige = blocs.find(b => b.nom === fichier.nom);
-
-    if (fichierCorrige) {
-      console.log(`✅ ${fichier.nom} corrigé par OpenRouter`);
-      return {
-        success: true,
-        fichierCorrige: { ...fichier, contenu: fichierCorrige.contenu },
-        explication: reponse.replace(/```[\s\S]*?```/g, '').trim(),
-        provider: 'openrouter'
-      };
-    }
-    throw new Error('OpenRouter n\'a pas renvoyé le fichier');
-  } catch (err) {
-    console.log(`❌ OpenRouter échec pour ${fichier.nom}:`, err.message);
-  }
-
-  // Essai 2 : Gemini
-  try {
-    console.log(`🔧 Fallback Gemini pour ${fichier.nom}...`);
-    const response = await axios.post(
-      GEMINI_URL(keys.gemini),
-      {
-        systemInstruction: { parts: [{ text: systemPrompt }] },
-        contents: [{ role: 'user', parts: [{ text: `Corrige ${fichier.nom}` }] }],
-        generationConfig: { temperature: 0.2, maxOutputTokens: 8000 }
-      },
-      { headers: { 'Content-Type': 'application/json' }, timeout: 180000 }
-    );
-
-    const reponse = response.data.candidates[0].content.parts[0].text;
-    const blocs = extraireBlocs(reponse);
-    const fichierCorrige = blocs.find(b => b.nom === fichier.nom);
-
-    if (fichierCorrige) {
-      console.log(`✅ ${fichier.nom} corrigé par Gemini`);
-      return {
-        success: true,
-        fichierCorrige: { ...fichier, contenu: fichierCorrige.contenu },
-        explication: reponse.replace(/```[\s\S]*?```/g, '').trim(),
-        provider: 'gemini'
-      };
-    }
-    throw new Error('Gemini n\'a pas renvoyé le fichier');
-  } catch (err) {
-    console.log(`❌ Gemini échec pour ${fichier.nom}:`, err.message);
-  }
-
-    // Essai 3 : Groq Qwen (stable, gratuit, rapide)
-  try {
-    console.log(`🔧 Fallback Groq pour ${fichier.nom}...`);
-    const response = await axios.post(
-      'https://api.groq.com/openai/v1/chat/completions',
-      {
-        model: 'qwen/qwen3.8-27b',
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: `Corrige ${fichier.nom}` }
-        ],
-        temperature: 0.2,
-        max_tokens: 8000
-      },
-      {
-        headers: {
-          'Authorization': `Bearer ${keys.groq}`,
-          'Content-Type': 'application/json'
-        },
-        timeout: 120000
-      }
-    );
-
-    const reponse = response.data.choices[0].message.content;
-    const blocs = extraireBlocs(reponse);
-    const fichierCorrige = blocs.find(b => b.nom === fichier.nom);
-
-    if (fichierCorrige) {
-      console.log(`✅ ${fichier.nom} corrigé par Groq`);
-      return {
-        success: true,
-        fichierCorrige: { ...fichier, contenu: fichierCorrige.contenu },
-        explication: reponse.replace(/```[\s\S]*?```/g, '').trim(),
-        provider: 'groq'
-      };
-    }
-    throw new Error('Groq n\'a pas renvoyé le fichier');
-  } catch (err) {
-    console.log(`❌ Groq échec pour ${fichier.nom}:`, err.message);
-  }
-
-  return {
-    success: false,
-    error: 'Ni Gemini ni OpenRouter ni Groq n\'ont pu corriger'
-  };
-}
+          
 
 async function pushGitHubMultiDossiers(repoFullName, blocks, githubToken) {
   if (!githubToken || !repoFullName) {
@@ -1938,8 +1838,10 @@ envoyer('status', { message: '🧪 Test du code dans la sandbox...' });
         prompt,
         fichierCible,
         testResult.stderr || testResult.stdout,
-        keys
-      );
+        keys,
+        project_id,
+        null 
+  );
 
       if (!correctionResult.success) {
         envoyer('message', { role: 'ia', content: `⚠️ Correction impossible au tour ${essais} : ${correctionResult.error || ''}` });
@@ -2454,7 +2356,7 @@ app.post('/api/deploy', iaLimiter, async (req, res) => {
   }
 });
 
-const server = app.listen(PORT, () => {
+const server = app.listen(PORT, '0.0.0.0', () => {
   console.log('Kenny serveur sur le port ' + PORT);
   console.log(`Modèle Gemini : ${GEMINI_MODEL}`);
 });
