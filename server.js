@@ -1358,10 +1358,18 @@ RÈGLES STRICTES :
 - Si l'erreur n'est pas dans ce fichier, renvoie le fichier tel quel
 
 ⚠️ SI L'ERREUR EST "ModuleNotFoundError: No module named 'X'" :
-  → Le code est probablement CORRECT, c'est juste une dépendance manquante
-  → Vérifie que requirements.txt existe et contient "X"
-  → Si requirements.txt n'existe pas, ce n'est PAS ton problème ici
-  → Renvoie le fichier tel quel${memoireContext}`;
+
+  CAS 1 — X est une dépendance EXTERNE (flask, numpy, pandas, requests, sqlalchemy, etc.) :
+    → Le code est correct, requirements.txt gère ça
+    → Renvoie le fichier tel quel
+
+  CAS 2 — X est un module LOCAL du projet (moteur, interface, templates, data, etc.) :
+    → C'EST UN VRAI BUG : le module n'est pas dans sys.path
+    → CORRIGE en ajoutant AU DÉBUT du fichier (avant les imports locaux) :
+      import os
+      import sys
+      sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    → Renvoie le fichier COMPLET avec ce fix${memoireContext}`;
 
   // Essai 1 : OpenRouter
   try {
