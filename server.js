@@ -1791,6 +1791,43 @@ envoyer('status', { message: `📦 ${blocks.length} fichiers générés` });
   updatedAt: new Date().toISOString()
 });
 envoyer('status', { message: '🧪 Test du code dans la sandbox...' }); 
+  // 🚨 GARANTIR les fichiers critiques AVANT le premier test
+  {
+    const hasRequirements = blocks.some(b => b.nom === 'requirements.txt');
+    if (!hasRequirements) {
+      console.log('⚠️ requirements.txt manquant — génération automatique');
+      const deps = new Set();
+      for (const b of blocks) {
+        if (b.langage === 'python' || b.nom.endsWith('.py')) {
+          const matches = (b.contenu || '').matchAll(/^\s*(?:from|import)\s+([a-zA-Z_][a-zA-Z0-9_]*)/gm);
+          for (const m of matches) {
+            const pkg = m[1].toLowerCase();
+            if (['flask', 'numpy', 'scipy', 'pandas', 'requests', 'sqlalchemy', 'pytest'].includes(pkg)) {
+              deps.add(pkg);
+            }
+          }
+        }
+      }
+      if (deps.size === 0) deps.add('flask');
+      blocks.push({ nom: 'requirements.txt', langage: 'txt', contenu: [...deps].join('\n') + '\n' });
+      console.log(`✅ requirements.txt généré : ${[...deps].join(', ')}`);
+    }
+
+    const hasRunPy = blocks.some(b => b.nom === 'run.py');
+    if (!hasRunPy) {
+      console.log('⚠️ run.py manquant — génération automatique');
+      const hasServeur = blocks.some(b => b.nom === 'interface/serveur.py');
+      if (hasServeur) {
+        blocks.push({
+          nom: 'run.py',
+          langage: 'python',
+          contenu: `from interface.serveur import create_app\nimport os\n\nif __name__ == "__main__":\n    app = create_app()\n    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 3000)))\n`
+        });
+        console.log('✅ run.py généré');
+      }
+    }
+  }
+
   let testResult = await tester.testerCodePython(blocks);
   sandboxFinale = testResult.sandbox;
 
