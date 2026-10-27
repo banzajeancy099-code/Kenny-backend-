@@ -208,6 +208,52 @@ app.get('/', (req, res) => {
   res.json({ message: 'Kenny OK', gemini: GLOBAL_KEYS.gemini ? '✅' : '❌', model: GEMINI_MODEL });
 });
 
+// ============================================
+// 🧪 /api/football/test — Vérifie les clés API football
+// ============================================
+app.get('/api/football/test', async (req, res) => {
+  const results = {
+    bzzoiro: { configured: !!GLOBAL_KEYS.bzzoiro, valid: false },
+    apiFootball: { configured: !!GLOBAL_KEYS.apiFootball, valid: false }
+  };
+  
+  // Test Bzzoiro
+  if (GLOBAL_KEYS.bzzoiro) {
+    try {
+      const r = await axios.get('https://sports.bzzoiro.com/api/v2/leagues/?limit=1', {
+        headers: { 'Authorization': `Token ${GLOBAL_KEYS.bzzoiro}` },
+        timeout: 10000
+      });
+      results.bzzoiro.valid = r.status === 200;
+      results.bzzoiro.leagues_count = r.data?.count;
+    } catch (e) {
+      results.bzzoiro.error = e.response?.status || e.message;
+    }
+  }
+  
+  // Test API-Football
+  if (GLOBAL_KEYS.apiFootball) {
+    try {
+      const r = await axios.get('https://v3.football.api-sports.io/status', {
+        headers: { 'x-apisports-key': GLOBAL_KEYS.apiFootball },
+        timeout: 10000
+      });
+      const hasErrors = r.data?.errors && Object.keys(r.data.errors).length > 0;
+      results.apiFootball.valid = !hasErrors;
+      if (hasErrors) {
+        results.apiFootball.errors = r.data.errors;
+      } else {
+        results.apiFootball.plan = r.data?.response?.subscription?.plan;
+        results.apiFootball.quota = r.data?.response?.requests;
+      }
+    } catch (e) {
+      results.apiFootball.error = e.response?.status || e.message;
+    }
+  }
+  
+  res.json({ success: true, ...results });
+});
+
 app.post('/api/user/sync', async (req, res) => {
   const { firebase_uid, email } = req.body;
   if (!firebase_uid || !email) return res.status(400).json({ error: 'Champs requis' });
