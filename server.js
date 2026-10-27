@@ -61,7 +61,10 @@ const GLOBAL_KEYS = {
   openrouter: process.env.OPENROUTER_API_KEY,
   // 🆕 Nouveaux providers
   mistral: process.env.MISTRAL_API_KEY,
-  githubModels: process.env.GITHUB_TOKEN
+  // 🆕 APIs football (2026)
+bzzoiro: process.env.BZZOIRO_API_KEY,
+apiFootball: process.env.API_FOOTBALL_KEY,
+githubModels: process.env.GITHUB_TOKEN
 };
 
 const buildsEnCours = new Map();
