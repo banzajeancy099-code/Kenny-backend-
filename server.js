@@ -22,9 +22,6 @@ process.on('uncaughtException', (err) => {
 
 const app = express();
 app.set('trust proxy', 1);
-
-app.set('trust proxy', 1);
-
 const PORT = process.env.PORT || 3000;
 
 const LIMITE_FREE = 50;
@@ -1289,8 +1286,6 @@ envoyer('status', { message: '🐙 Push sur GitHub...' });
 // 🔧 CORRECTION CIBLÉE (une seule passe, contexte préservé)
 // ============================================
 async function corrigerFichierCible(promptOriginal, fichier, erreur, keys, project_id = null, user_id = null) {
-  console.log('🔍 corrigerFichierCible appelé : user_id=', user_id, ', project_id=', project_id);
-
   // 🧠 Détecte le contexte du fichier
   const contexte = memoire.detecterContexte(fichier, fichier.contenu, promptOriginal);
   contexte.fichier = fichier.nom;
@@ -1884,26 +1879,26 @@ envoyer('status', { message: '🧪 Test du code dans la sandbox...' });
         envoyer('message', { role: 'ia', content: `⚠️ Fichier "${fichierCoupableNom}" introuvable, abandon.` });
         break;
       }
+
       // 🧠 Récupère user_id pour activer la mémoire
-      let userId = null;
-      try {
-        userId = await withPg(async (client) => {
-          const r = await client.query('SELECT id FROM users WHERE firebase_uid = $1', [firebase_uid]);
-          return r.rows.length > 0 ? r.rows[0].id : null;
-        });
-      } catch (e) {
-        console.log('⚠️ userId fetch échoué:', e.message);
-      }
+let userId = null;
+try {
+  userId = await withPg(async (client) => {
+    const r = await client.query('SELECT id FROM users WHERE firebase_uid = $1', [firebase_uid]);
+    return r.rows.length > 0 ? r.rows[0].id : null;
+  });
+} catch (e) {
+  console.log('⚠️ userId fetch échoué:', e.message);
+}
 
-
-      const correctionResult = await corrigerFichierCible(
-        prompt,
-        fichierCible,
-        testResult.stderr || testResult.stdout,
-        keys,
-        project_id,
-        userId 
-  );
+const correctionResult = await corrigerFichierCible(
+  prompt,
+  fichierCible,
+  testResult.stderr || testResult.stdout,
+  keys,
+  project_id,
+  userId
+);
 
       if (!correctionResult.success) {
         envoyer('message', { role: 'ia', content: `⚠️ Correction impossible au tour ${essais} : ${correctionResult.error || ''}` });
