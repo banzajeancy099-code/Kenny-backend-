@@ -1283,7 +1283,43 @@ envoyer('status', { message: '🐙 Push sur GitHub...' });
 // ============================================
 // 🔧 CORRECTION CIBLÉE (une seule passe, contexte préservé)
 // ============================================
-async function corrigerFichierCible(promptOriginal, fichier, erreur, keys) {
+async function corrigerFichierCible(promptOriginal, fichier, erreur, keys, project_id = null, user_id = null) {
+  // 🧠 Détecte le contexte du fichier
+  const contexte = memoire.detecterContexte(fichier, fichier.contenu, promptOriginal);
+  contexte.fichier = fichier.nom;
+  contexte.erreur = erreur;
+
+  // 🧠 Cherche des corrections similaires dans la mémoire
+  let correctionsSimilaires = [];
+  if (user_id) {
+    try {
+      correctionsSimilaires = await memoire.chercherCorrectionsSimilaires(
+        erreur, fichier, contexte, user_id, project_id, keys.gemini, 3, withPg
+      );
+      if (correctionsSimilaires.length > 0) {
+        console.log(`🧠 Mémoire : ${correctionsSimilaires.length} correction(s) similaire(s)`);
+      }
+    } catch (e) {
+      console.log('⚠️ Recherche mémoire échec:', e.message);
+    }
+  }
+
+  // Construit le contexte mémoire pour le prompt
+  let memoireContext = '';
+  if (correctionsSimilaires.length > 0) {
+    memoireContext = `\n\n📚 CORRECTIONS SIMILAIRES QUI ONT FONCTIONNÉ DANS LE PASSÉ :\n`;
+    for (const c of correctionsSimilaires) {
+      memoireContext += `\n---\n`;
+      memoireContext += `Erreur : ${c.erreur_message.substring(0, 200)}\n`;
+      memoireContext += `Fichier : ${c.fichier_coupable}\n`;
+      memoireContext += `Type : ${c.erreur_type}\n`;
+      memoireContext += `Correction : ${c.explication || 'voir code'}\n`;
+      if (c.code_avant) memoireContext += `Code avant (extrait) : ${c.code_avant.substring(0, 300)}...\n`;
+      if (c.code_apres) memoireContext += `Code après (extrait) : ${c.code_apres.substring(0, 300)}...\n`;
+    }
+    memoireContext += `\n---\n⚠️ Ces corrections sont des INSPIRATIONS. Adapte-les au contexte actuel. Ne copie pas aveuglément.\n`;
+  }
+
   const systemPrompt = `Tu es un développeur senior qui CORRIGE UN SEUL FICHIER Python.
 
 CONTEXTE DU PROJET (demande originale de l'utilisateur) :
@@ -1318,7 +1354,13 @@ RÈGLES STRICTES :
 - Ne renomme PAS le fichier
 - Ne change PAS la structure du projet
 - Garde le style de code existant
-- Si l'erreur n'est pas dans ce fichier, renvoie le fichier tel quel`;
+- Si l'erreur n'est pas dans ce fichier, renvoie le fichier tel quel
+
+⚠️ SI L'ERREUR EST "ModuleNotFoundError: No module named 'X'" :
+  → Le code est probablement CORRECT, c'est juste une dépendance manquante
+  → Vérifie que requirements.txt existe et contient "X"
+  → Si requirements.txt n'existe pas, ce n'est PAS ton problème ici
+  → Renvoie le fichier tel quel${memoireContext}`;
 
   // Essai 1 : OpenRouter
   try {
@@ -1338,6 +1380,168 @@ RÈGLES STRICTES :
         headers: {
           'Authorization': `Bearer ${keys.openrouter}`,
           'Content-Type': 'application/json',
+          'HTTP-Referer': 'https://kenny.dev',
+          'X-Title': 'Kenny'
+        },
+        timeout: 180000
+      }
+    );
+
+    const reponse = response.data.choices[0].message.content;
+    const blocs = extraireBlocs(reponse);
+    const fichierCorrige = blocs.find(b => b.nom === fichier.nom);
+
+    if (fichierCorrige) {
+      console.log(`✅ ${fichier.nom} corrigé par OpenRouter`);
+
+      // 🧠 Enregistre dans la mémoire
+      if (user_id) {
+        await memoire.enregistrerCorrection({
+          project_id, user_id,
+          fichier: fichier.nom,
+          contexte,
+          erreur,
+          codeAvant: fichier.contenu,
+          codeApres: fichierCorrige.contenu,
+          explication: reponse.replace(/```[\s\S]*?```/g, '').trim(),
+          provider: 'openrouter',
+          succes: true,
+          tentatives: 1
+        }, keys.gemini, withPg);
+      }
+
+      return {
+        success: true,
+        fichierCorrige: { ...fichier, contenu: fichierCorrige.contenu },
+        explication: reponse.replace(/```[\s\S]*?```/g, '').trim(),
+        provider: 'openrouter',
+        correctionsUtilisees: correctionsSimilaires.map(c => c.id)
+      };
+    }
+    throw new Error('OpenRouter n\'a pas renvoyé le fichier');
+  } catch (err) {
+    console.log(`❌ OpenRouter échec pour ${fichier.nom}:`, err.message);
+  }
+
+  // Essai 2 : Gemini
+  try {
+    console.log(`🔧 Fallback Gemini pour ${fichier.nom}...`);
+    const response = await axios.post(
+      GEMINI_URL(keys.gemini),
+      {
+        systemInstruction: { parts: [{ text: systemPrompt }] },
+        contents: [{ role: 'user', parts: [{ text: `Corrige ${fichier.nom}` }] }],
+        generationConfig: { temperature: 0.2, maxOutputTokens: 8000 }
+      },
+      { headers: { 'Content-Type': 'application/json' }, timeout: 180000 }
+    );
+
+    const reponse = response.data.candidates[0].content.parts[0].text;
+    const blocs = extraireBlocs(reponse);
+    const fichierCorrige = blocs.find(b => b.nom === fichier.nom);
+
+    if (fichierCorrige) {
+      console.log(`✅ ${fichier.nom} corrigé par Gemini`);
+
+      if (user_id) {
+        await memoire.enregistrerCorrection({
+          project_id, user_id,
+          fichier: fichier.nom,
+          contexte,
+          erreur,
+          codeAvant: fichier.contenu,
+          codeApres: fichierCorrige.contenu,
+          explication: reponse.replace(/```[\s\S]*?```/g, '').trim(),
+          provider: 'gemini',
+          succes: true,
+          tentatives: 1
+        }, keys.gemini, withPg);
+      }
+
+      return {
+        success: true,
+        fichierCorrige: { ...fichier, contenu: fichierCorrige.contenu },
+        explication: reponse.replace(/```[\s\S]*?```/g, '').trim(),
+        provider: 'gemini',
+        correctionsUtilisees: correctionsSimilaires.map(c => c.id)
+      };
+    }
+    throw new Error('Gemini n\'a pas renvoyé le fichier');
+  } catch (err) {
+    console.log(`❌ Gemini échec pour ${fichier.nom}:`, err.message);
+  }
+
+  // Essai 3 : Groq
+  try {
+    console.log(`🔧 Fallback Groq pour ${fichier.nom}...`);
+    const response = await axios.post(
+      'https://api.groq.com/openai/v1/chat/completions',
+      {
+        model: 'qwen/qwen3.8-27b',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: `Corrige ${fichier.nom}` }
+        ],
+        temperature: 0.2,
+        max_tokens: 8000
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${keys.groq}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 120000
+      }
+    );
+
+    const reponse = response.data.choices[0].message.content;
+    const blocs = extraireBlocs(reponse);
+    const fichierCorrige = blocs.find(b => b.nom === fichier.nom);
+
+    if (fichierCorrige) {
+      console.log(`✅ ${fichier.nom} corrigé par Groq`);
+
+      if (user_id) {
+        await memoire.enregistrerCorrection({
+          project_id, user_id,
+          fichier: fichier.nom,
+          contexte,
+          erreur,
+          codeAvant: fichier.contenu,
+          codeApres: fichierCorrige.contenu,
+          explication: reponse.replace(/```[\s\S]*?```/g, '').trim(),
+          provider: 'groq',
+          succes: true,
+          tentatives: 1
+        }, keys.gemini, withPg);
+      }
+
+      return {
+        success: true,
+        fichierCorrige: { ...fichier, contenu: fichierCorrige.contenu },
+        explication: reponse.replace(/```[\s\S]*?```/g, '').trim(),
+        provider: 'groq',
+        correctionsUtilisees: correctionsSimilaires.map(c => c.id)
+      };
+    }
+    throw new Error('Groq n\'a pas renvoyé le fichier');
+  } catch (err) {
+    console.log(`❌ Groq échec pour ${fichier.nom}:`, err.message);
+  }
+
+  // 🧠 Aucun provider n'a réussi → pénalise les corrections utilisées
+  if (correctionsSimilaires.length > 0 && user_id) {
+    await memoire.penaliserCorrection(
+      correctionsSimilaires.map(c => c.id),
+      withPg
+    );
+  }
+
+  return {
+    success: false,
+    error: 'Ni Gemini ni OpenRouter ni Groq n\'ont pu corriger'
+  };
+}
           'HTTP-Referer': 'https://kenny.dev',
           'X-Title': 'Kenny'
         },
