@@ -132,8 +132,11 @@ Réponds UNIQUEMENT par : OUI ou NON`;
     const answer = response.data.candidates[0].content.parts[0].text.trim().toUpperCase();
     return answer.startsWith('OUI');
   } catch (e) {
-    console.log('⚠️ Validation IA échec:', e.message);
-    return true;
+  console.log('⚠️ Embedding échec:', e.response?.data?.error?.message || e.message);
+  console.log('⚠️ Embedding status:', e.response?.status);
+  console.log('⚠️ Embedding data:', JSON.stringify(e.response?.data).substring(0, 500));
+  console.log('⚠️ Embedding request text:', texte.substring(0, 200));
+  return null;
   }
 }
 
