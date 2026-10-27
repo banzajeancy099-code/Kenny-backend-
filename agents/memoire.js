@@ -56,8 +56,20 @@ function classifierErreur(erreur) {
 // Génère un embedding via Gemini
 async function genererEmbedding(texte, geminiKey) {
   if (!geminiKey) return null;
+  
+  // 🧹 Sanitize
+  texte = String(texte || '')
+    .replace(/[\u0000-\u001F\u007F-\u009F]/g, ' ')
+    .replace(/[\u200B-\u200F\u2028-\u202F\uFEFF]/g, '')
+    .substring(0, 8000);
+  
+  if (!texte || texte.length < 5) {
+    console.log('⚠️ Embedding: texte vide après sanitize');
+    return null;
+  }
+  
   try {
-    // ✅ Modèle actuel : gemini-embedding-001 (text-embedding-004 shutdown 14/01/2026)
+    // ✅ Modèle actuel : gemini-embedding-001
     const response = await axios.post(
       `https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent?key=${geminiKey}`,
       {
@@ -132,11 +144,8 @@ Réponds UNIQUEMENT par : OUI ou NON`;
     const answer = response.data.candidates[0].content.parts[0].text.trim().toUpperCase();
     return answer.startsWith('OUI');
   } catch (e) {
-  console.log('⚠️ Embedding échec:', e.response?.data?.error?.message || e.message);
-  console.log('⚠️ Embedding status:', e.response?.status);
-  console.log('⚠️ Embedding data:', JSON.stringify(e.response?.data).substring(0, 500));
-  console.log('⚠️ Embedding request text:', texte.substring(0, 200));
-  return null;
+    console.log('⚠️ Validation IA échec:', e.message);
+    return true;
   }
 }
 
