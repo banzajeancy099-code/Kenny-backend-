@@ -57,17 +57,25 @@ function classifierErreur(erreur) {
 async function genererEmbedding(texte, geminiKey) {
   if (!geminiKey) return null;
   try {
+    // ✅ Modèle actuel : gemini-embedding-001 (text-embedding-004 shutdown 14/01/2026)
     const response = await axios.post(
-      `https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key=${geminiKey}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent?key=${geminiKey}`,
       {
-        model: 'models/text-embedding-004',
-        content: { parts: [{ text: texte.substring(0, 8000) }] }
+        model: 'models/gemini-embedding-001',
+        content: { parts: [{ text: texte.substring(0, 8000) }] },
+        outputDimensionality: 768
       },
       { timeout: 30000 }
     );
-    return response.data.embedding.values;
+    
+    let vec = response.data.embedding.values;
+    
+    // ⚠️ gemini-embedding-001 ne normalise pas automatiquement → L2 normalize
+    const norm = Math.sqrt(vec.reduce((s, v) => s + v * v, 0));
+    if (norm === 0) return vec;
+    return vec.map(v => v / norm);
   } catch (e) {
-    console.log('⚠️ Embedding échec:', e.message);
+    console.log('⚠️ Embedding échec:', e.response?.data?.error?.message || e.message);
     return null;
   }
 }
